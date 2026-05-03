@@ -4026,7 +4026,6 @@ export function App() {
       </button>
 
       <aside
-        aria-hidden={isMobileDrawer && !isAiPanelOpen ? true : undefined}
         aria-label={t("generationPanelAria")}
         aria-modal={isMobileDrawer && isAiPanelOpen ? true : undefined}
         className="ai-panel fixed inset-y-0 right-0 z-20 flex flex-col border-l border-neutral-200 bg-white shadow-2xl shadow-neutral-950/15"

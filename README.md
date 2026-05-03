@@ -16,6 +16,7 @@ Local professional AI canvas built with tldraw, Hono, SQLite, and GPT Image 2. V
 - Generation history with locate, rerun, download, and cloud upload status.
 - OpenAI-compatible image endpoint support, including PackyCode / `gpt-image` style responses.
 - Credential-aware routes with a global provider configuration dialog, API-key priority, local API storage, and optional Codex login fallback.
+- Agent canvas generation: a right-panel Agent tab can turn a conversation into an inspectable plan node, then execute batch and dependency-based image jobs around that node.
 
 ## Requirements
 
@@ -62,6 +63,24 @@ Open the web app at `http://localhost:5173`.
 The provider configuration dialog saves only one local OpenAI-compatible API profile. Local API keys are stored in the SQLite database under `DATA_DIR`, returned only as masked values, and preserved unless you enter a replacement key. This is meant for a local workstation workflow, not a public web deployment.
 
 Environment variables are still the most explicit operator-controlled source. They are visible as a read-only provider source in the dialog, are not edited by the app, and remain first in the default order. You can reorder sources in the UI, but do not expose the app publicly while `.env`, local provider keys, Codex tokens, or COS secrets are configured.
+
+## Agent Canvas Generation
+
+The right-side panel has `Manual` and `Agent` tabs. `Manual` keeps the original prompt-to-image and reference-image workflow. `Agent` is for planning multi-image work: type a natural-language request, choose default size / quality / output format, and optionally select up to three canvas images before sending.
+
+Agent planning uses a separate OpenAI-compatible chat configuration from the image provider configuration. Save it from the Agent LLM settings flow with an API key, Base URL, model, timeout, and `supportsVision`. The API key is persisted locally and masked on readback. Agent chat messages are not persisted in this first product version; refreshing the page clears the transcript, while plan nodes already on the canvas remain part of the normal canvas snapshot.
+
+When `supportsVision` is enabled, the selected canvas images are attached to the planning request as multimodal inputs. When it is disabled, the selected images are passed only as reference handles for later image generation; the planner must not claim to inspect their pixels. In both modes, each generation job can use at most three references.
+
+The Agent returns a strict `GenerationPlan` and the canvas creates an Agent plan node. The node shows the plan title, jobs, dependencies, expected output count, job status, thumbnails, and actions:
+
+- `Execute plan` confirms the current plan and runs it.
+- `Cancel` aborts the active WebSocket run; disconnecting the WebSocket also cancels the run.
+- `Retry failed` reruns failed or blocked jobs while preserving succeeded upstream jobs.
+
+Execution is DAG-based. Jobs with no unresolved dependencies can run in parallel; jobs that reference generated outputs wait for their upstream job to produce a visible image. Intermediate anchor images and final images are both saved as normal generation records and placed as standard tldraw image shapes around the plan node. The first version caps one plan at 16 total generated images, including intermediate anchors. Dependency source jobs and generated anchor jobs must produce exactly one image.
+
+Plans are not stored as separate gallery groups. The Gallery and history continue to use the existing `GenerationRecord` records created by each executed job.
 
 ## Upgrading To v0.1.0
 
@@ -123,6 +142,9 @@ pnpm build
 - `pnpm typecheck` checks shared, web, and API TypeScript.
 - `pnpm build` builds shared, web, and API packages.
 - `pnpm start` starts the built API package.
+- `pnpm --filter @gpt-image-canvas/api smoke:planner` checks Agent plan validation fixtures.
+- `pnpm --filter @gpt-image-canvas/api smoke:agent` checks Agent config and WebSocket basics.
+- `pnpm --filter @gpt-image-canvas/api smoke:executor` checks Agent DAG execution with a fake image provider.
 
 ## Docker
 
@@ -187,7 +209,7 @@ Cloud upload failures do not fail image generation. The asset remains available 
 
 Runtime state is stored under `DATA_DIR`, which defaults to `./data` locally and `/app/data` in Docker. The directory contains:
 
-- `gpt-image-canvas.sqlite` for the default project, generation history, asset metadata, cloud upload metadata, one optional local provider configuration, optional COS settings, and Codex OAuth token records.
+- `gpt-image-canvas.sqlite` for the default project, generation history, asset metadata, cloud upload metadata, one optional local provider configuration, one optional Agent LLM configuration, optional COS settings, and Codex OAuth token records.
 - `assets/` for generated image files.
 
 The Docker Compose workflow bind-mounts host `./data` to `/app/data`, so projects and generated assets survive container rebuilds. Do not commit `.env`, `data/`, generated images, SQLite files, or build output.
@@ -196,6 +218,7 @@ The Docker Compose workflow bind-mounts host `./data` to `/app/data`, so project
 
 - Secrets are read only from `.env`, runtime environment variables, or the local SQLite settings database. Never commit `.env`, expanded Docker Compose config output, shell history containing keys, SQLite databases, or logs that include secret values.
 - Local provider API keys saved from the top-right provider dialog are stored in SQLite and masked by the provider-config API. Treat `data/gpt-image-canvas.sqlite` as sensitive after saving a local API key, and do not publish the local app without adding your own authentication and network controls.
+- Agent LLM API keys saved for the Agent tab are also stored in SQLite and masked by the Agent config API. Agent transcript messages are not persisted, but prompts can still pass through your configured Agent LLM provider during a live run.
 - Codex OAuth access tokens, refresh tokens, ID tokens, email, account ID, expiry, and refresh timestamps are stored in local SQLite under `DATA_DIR`. Treat the SQLite database as sensitive runtime data after Codex login.
 - COS SecretKey values saved from the UI are stored locally in SQLite and are masked by the settings API. Treat `data/gpt-image-canvas.sqlite` as sensitive when COS is configured.
 - Prompts, project state, generated assets, and SQLite data are local runtime data under `DATA_DIR`. Treat `data/` as private unless you intentionally export specific assets.
@@ -208,6 +231,8 @@ The Docker Compose workflow bind-mounts host `./data` to `/app/data`, so project
 - Codex login cannot complete: confirm the machine can reach `https://auth.openai.com`, keep the device-login dialog open until authorization finishes, and restart the flow if the user code expires. Do not paste or log token values.
 - Custom provider endpoint: set `OPENAI_BASE_URL` in `.env`, for example `https://api.example.com/v1`, then restart the API or Docker container, or enter a local Base URL in `配置`. The endpoint must be OpenAI-compatible and support the configured image model.
 - Missing model access: confirm the OpenAI organization and project used by the active provider key can access the configured image model. Set `OPENAI_IMAGE_MODEL` or the local advanced model field if your compatible endpoint expects a different model name.
+- Agent cannot plan: confirm the Agent LLM configuration is saved and points to an OpenAI-compatible chat or multimodal chat endpoint. If `supportsVision` is enabled, very large selected canvas images can make the upstream request fail; try deselecting images or using a text-only Agent configuration.
+- Agent plan cannot execute: confirm the normal image provider is configured separately from the Agent LLM provider. Plan execution uses the image provider for actual images, and the Agent WebSocket cancels the current run if the browser disconnects.
 - High-resolution generation timeouts: upstream image requests default to 20 minutes; increase `OPENAI_IMAGE_TIMEOUT_MS` or the local provider timeout field if needed.
 - Port already in use: set `PORT` in `.env` for the API/Docker runtime. If Web port `5173` is occupied, stop the process using it, or run `pnpm web:dev -- --port 5174` explicitly and open the printed URL.
 - Docker build cannot pull the Node base image: use a locally cached image with `NODE_IMAGE=node:23-bullseye-slim docker compose up --build` on macOS/Linux or `$env:NODE_IMAGE = 'node:23-bullseye-slim'` followed by `docker compose up --build` in Windows PowerShell, or restore Docker Hub access and rerun `docker compose up --build`.

@@ -332,7 +332,7 @@
     {
       "id": "AG-006",
       "title": "Document Agent workflow and complete verification handoff",
-      "status": "open",
+      "status": "done",
       "dependsOn": [
         "AG-005"
       ],
@@ -351,6 +351,20 @@
         "If live provider credentials or Agent LLM credentials are unavailable, record the exact environmental blocker in Ralph run notes without reading, printing, or committing secrets.",
         "Confirm git status excludes .env, .ralph, .codex-temp, data, generated images, SQLite databases, screenshots, and build output from commits.",
         "Verification: final story records commands run, browser findings, changed files, and residual risks."
+      ],
+      "startedAt": "2026-05-03T15:15:58.0019650+00:00",
+      "completedAt": "2026-05-03T15:20:41.1431800+00:00",
+      "updatedAt": "2026-05-03T15:20:41.1431800+00:00",
+      "verificationNotes": [
+        "Updated README.md and README.zh-CN.md with Agent LLM setup, Agent tab usage, selected reference behavior, supportsVision behavior, plan node lifecycle, execution confirmation, cancel, retry, v1 caps, privacy notes, and troubleshooting.",
+        "Ran pnpm typecheck successfully after the final docs and mobile drawer accessibility fix.",
+        "Ran pnpm --filter @gpt-image-canvas/api smoke:planner, pnpm --filter @gpt-image-canvas/api smoke:agent, and pnpm --filter @gpt-image-canvas/api smoke:executor successfully. The smoke:agent and smoke:executor runs emitted only the Node punycode deprecation warning.",
+        "Ran pnpm build successfully. Vite emitted the existing Node 22.11.0 version warning and large chunk warning.",
+        "Browser-verified http://127.0.0.1:5173/canvas on desktop 1440x900 and mobile 390x844 using the existing dev server on port 5173. Manual tab and Agent tab rendered without overlap; Agent config state, selected reference cap display, and mobile drawer behavior were visible.",
+        "Browser console had no JavaScript runtime errors after the final fix. Remaining non-blocking console output: tldraw zh-cn missing message warnings and a form field id/name accessibility issue.",
+        "Live Agent planning with the current local fake vision config and selected large app preview previously returned HTTP 400 in this environment; no secrets were read or printed. Planner and executor behavior were verified with deterministic smoke scripts and fake image provider coverage.",
+        "Changed files for AG-006: README.md, README.zh-CN.md, apps/web/src/App.tsx, and .agents/tasks/prd-agent-canvas-generation.json.",
+        "Pre-commit git status contained only the AG-006 source/docs/PRD files; .env, .ralph, .codex-temp, data, generated images, SQLite databases, screenshots, and build output were not staged."
       ]
     }
   ]
