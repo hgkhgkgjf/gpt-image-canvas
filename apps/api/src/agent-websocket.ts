@@ -16,6 +16,10 @@ import {
 import { createGenerationPlan } from "./agent-planner.js";
 
 const OPEN_READY_STATE = 1;
+const AGENT_SOCKET_SERVER_HEARTBEAT_INTERVAL_MS = 10_000;
+const AGENT_ACTIVE_DISCONNECT_GRACE_MS = 2 * 60 * 60 * 1000;
+const AGENT_IDLE_DISCONNECT_GRACE_MS = 5 * 60 * 1000;
+const AGENT_PENDING_EVENT_LIMIT = 500;
 const CLIENT_MESSAGE_TYPES: readonly AgentClientMessageType[] = [
   "user_message",
   "revise_plan",
@@ -39,8 +43,12 @@ interface ActiveAgentRun {
 
 interface AgentSocketSession {
   connectionId: string;
+  ws?: WSContext;
   activeRun?: ActiveAgentRun;
   plans: Map<string, StoredAgentGenerationPlan>;
+  pendingEvents: AgentServerEvent[];
+  keepAliveTimer?: ReturnType<typeof setInterval>;
+  disconnectTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface ParsedMessage {
@@ -56,31 +64,41 @@ interface MessageParseError {
 
 const sessions = new Map<string, AgentSocketSession>();
 
-export function createAgentWebSocketEvents(): WSEvents {
-  const session: AgentSocketSession = {
-    connectionId: randomUUID(),
-    plans: new Map()
-  };
+export function createAgentWebSocketEvents(connectionId?: string, runId?: string): WSEvents {
+  const { resumeFailedRunId, session } = resolveAgentSocketSession(connectionId, runId);
 
   return {
     onOpen(_event, ws) {
-      sessions.set(session.connectionId, session);
-      sendEvent(ws, {
+      attachAgentSocket(session, ws);
+      sendDirectEvent(ws, {
         type: "connected",
         connectionId: session.connectionId,
         timestamp: new Date().toISOString()
       });
+      if (resumeFailedRunId) {
+        sendSessionError(session, {
+          code: "agent_session_expired",
+          message: "Agent session expired before the browser could reconnect. Start a new Agent run.",
+          runId: resumeFailedRunId,
+          recoverable: true
+        });
+        sendSessionEvent(session, {
+          type: "run_done",
+          runId: resumeFailedRunId,
+          status: "failed",
+          timestamp: new Date().toISOString()
+        });
+      }
+      flushPendingSessionEvents(session);
     },
     onMessage(event, ws) {
       handleAgentMessage(event.data, ws, session);
     },
-    onClose() {
-      cancelActiveRun(session, "socket_disconnected");
-      sessions.delete(session.connectionId);
+    onClose(_event, ws) {
+      detachAgentSocket(session, ws, "socket_disconnected");
     },
-    onError() {
-      cancelActiveRun(session, "socket_error");
-      sessions.delete(session.connectionId);
+    onError(_event, ws) {
+      detachAgentSocket(session, ws, "socket_error");
     }
   };
 }
@@ -88,14 +106,158 @@ export function createAgentWebSocketEvents(): WSEvents {
 export function closeAllAgentSessions(reason = "server_shutdown"): void {
   for (const session of sessions.values()) {
     cancelActiveRun(session, reason);
+    disposeAgentSession(session);
   }
   sessions.clear();
 }
 
-function handleAgentMessage(data: WSMessageReceive, ws: WSContext, session: AgentSocketSession): void {
+function createAgentSocketSession(): AgentSocketSession {
+  return {
+    connectionId: randomUUID(),
+    plans: new Map(),
+    pendingEvents: []
+  };
+}
+
+function resolveAgentSocketSession(
+  requestedConnectionId?: string,
+  requestedRunId?: string
+): { session: AgentSocketSession; resumeFailedRunId?: string } {
+  const connectionId = requestedConnectionId?.trim();
+  const runId = requestedRunId?.trim();
+  if (connectionId) {
+    const existingSession = sessions.get(connectionId);
+    if (existingSession) {
+      return { session: existingSession };
+    }
+  }
+
+  if (runId) {
+    const activeRunSession = [...sessions.values()].find((session) => session.activeRun?.id === runId);
+    if (activeRunSession) {
+      return { session: activeRunSession };
+    }
+  }
+
+  const session = createAgentSocketSession();
+  return {
+    session,
+    resumeFailedRunId: connectionId && runId ? runId : undefined
+  };
+}
+
+function attachAgentSocket(session: AgentSocketSession, ws: WSContext): void {
+  clearSessionDisconnectTimer(session);
+  if (session.ws && session.ws !== ws) {
+    closeAgentSocket(session.ws, 1012, "agent_session_replaced");
+  }
+
+  session.ws = ws;
+  sessions.set(session.connectionId, session);
+  startSessionKeepAlive(session);
+}
+
+function detachAgentSocket(session: AgentSocketSession, ws: WSContext, reason: string): void {
+  if (session.ws !== ws) {
+    return;
+  }
+
+  session.ws = undefined;
+  stopSessionKeepAlive(session);
+  scheduleDisconnectedSessionCleanup(session, reason);
+}
+
+function scheduleDisconnectedSessionCleanup(session: AgentSocketSession, reason = "socket_disconnected"): void {
+  if (session.ws) {
+    clearSessionDisconnectTimer(session);
+    return;
+  }
+
+  clearSessionDisconnectTimer(session);
+  const timeoutMs = session.activeRun ? AGENT_ACTIVE_DISCONNECT_GRACE_MS : AGENT_IDLE_DISCONNECT_GRACE_MS;
+  session.disconnectTimer = setTimeout(() => {
+    if (session.ws) {
+      return;
+    }
+
+    if (session.activeRun) {
+      cancelActiveRun(session, reason);
+    }
+    disposeAgentSession(session);
+  }, timeoutMs);
+}
+
+function clearSessionDisconnectTimer(session: AgentSocketSession): void {
+  if (session.disconnectTimer) {
+    clearTimeout(session.disconnectTimer);
+    session.disconnectTimer = undefined;
+  }
+}
+
+function startSessionKeepAlive(session: AgentSocketSession): void {
+  stopSessionKeepAlive(session);
+  session.keepAliveTimer = setInterval(() => {
+    const ws = session.ws;
+    if (!ws) {
+      return;
+    }
+
+    const heartbeat: AgentServerEvent = {
+      type: "pong",
+      requestId: `agent-server-heartbeat-${session.connectionId}-${Date.now()}`,
+      runId: session.activeRun?.id,
+      timestamp: new Date().toISOString()
+    };
+    if (!sendDirectEvent(ws, heartbeat)) {
+      detachAgentSocket(session, ws, "socket_send_failed");
+    }
+  }, AGENT_SOCKET_SERVER_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopSessionKeepAlive(session: AgentSocketSession): void {
+  if (session.keepAliveTimer) {
+    clearInterval(session.keepAliveTimer);
+    session.keepAliveTimer = undefined;
+  }
+}
+
+function disposeAgentSession(session: AgentSocketSession): void {
+  clearSessionDisconnectTimer(session);
+  stopSessionKeepAlive(session);
+  session.pendingEvents = [];
+  session.ws = undefined;
+  sessions.delete(session.connectionId);
+}
+
+function closeAgentSocket(ws: WSContext, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch {
+    // The socket may already be closed by the underlying adapter.
+  }
+}
+
+function flushPendingSessionEvents(session: AgentSocketSession): void {
+  const ws = session.ws;
+  if (!ws || session.pendingEvents.length === 0) {
+    return;
+  }
+
+  const events = session.pendingEvents;
+  session.pendingEvents = [];
+  for (let index = 0; index < events.length; index += 1) {
+    if (!sendDirectEvent(ws, events[index])) {
+      session.pendingEvents = events.slice(index);
+      detachAgentSocket(session, ws, "socket_flush_failed");
+      return;
+    }
+  }
+}
+
+function handleAgentMessage(data: WSMessageReceive, _ws: WSContext, session: AgentSocketSession): void {
   const parsed = parseAgentClientMessage(data);
   if (!parsed.ok) {
-    sendError(ws, {
+    sendSessionError(session, {
       code: parsed.code,
       message: parsed.message,
       recoverable: true
@@ -105,7 +267,7 @@ function handleAgentMessage(data: WSMessageReceive, ws: WSContext, session: Agen
 
   const message = parsed.value;
   if (message.type === "ping") {
-    sendEvent(ws, {
+    sendSessionEvent(session, {
       type: "pong",
       requestId: message.requestId,
       runId: message.runId,
@@ -116,7 +278,7 @@ function handleAgentMessage(data: WSMessageReceive, ws: WSContext, session: Agen
 
   if (message.type === "cancel_run") {
     const cancelled = cancelActiveRun(session, "client_cancelled", message.runId);
-    sendEvent(ws, {
+    sendSessionEvent(session, {
       type: "run_cancelled",
       requestId: message.requestId,
       runId: cancelled.runId,
@@ -128,11 +290,11 @@ function handleAgentMessage(data: WSMessageReceive, ws: WSContext, session: Agen
   }
 
   if (AGENT_WORK_MESSAGE_TYPES.has(message.type)) {
-    handleAgentWorkMessage(message, ws, session);
+    handleAgentWorkMessage(message, session);
     return;
   }
 
-  sendError(ws, {
+  sendSessionError(session, {
     code: "unsupported_agent_message",
     message: "Unsupported Agent WebSocket message.",
     requestId: message.requestId,
@@ -141,10 +303,10 @@ function handleAgentMessage(data: WSMessageReceive, ws: WSContext, session: Agen
   });
 }
 
-function handleAgentWorkMessage(message: AgentClientMessage, ws: WSContext, session: AgentSocketSession): void {
+function handleAgentWorkMessage(message: AgentClientMessage, session: AgentSocketSession): void {
   const llmConfig = getUsableAgentLlmConfig();
   if (!llmConfig) {
-    sendError(ws, {
+    sendSessionError(session, {
       code: "missing_agent_config",
       message: "Configure an Agent LLM before using the Agent.",
       requestId: message.requestId,
@@ -156,7 +318,7 @@ function handleAgentWorkMessage(message: AgentClientMessage, ws: WSContext, sess
 
   if (message.type === "user_message") {
     if (session.activeRun) {
-      sendError(ws, {
+      sendSessionError(session, {
         code: "agent_run_in_progress",
         message: "An Agent run is already in progress for this connection.",
         requestId: message.requestId,
@@ -173,13 +335,13 @@ function handleAgentWorkMessage(message: AgentClientMessage, ws: WSContext, sess
       cancelled: false
     };
     session.activeRun = activeRun;
-    void handleAgentPlanMessage(message, ws, session, activeRun, llmConfig);
+    void handleAgentPlanMessage(message, session, activeRun, llmConfig);
     return;
   }
 
   if (message.type === "execute_plan" || message.type === "retry_failed") {
     if (session.activeRun) {
-      sendError(ws, {
+      sendSessionError(session, {
         code: "agent_run_in_progress",
         message: "An Agent run is already in progress for this connection.",
         requestId: message.requestId,
@@ -191,7 +353,7 @@ function handleAgentWorkMessage(message: AgentClientMessage, ws: WSContext, sess
 
     const storedPlan = resolveStoredPlanForExecution(session, message);
     if (!storedPlan) {
-      sendError(ws, {
+      sendSessionError(session, {
         code: "unknown_agent_plan",
         message: "The requested Agent plan is not available. Regenerate the plan or execute it from the canvas node payload.",
         requestId: message.requestId,
@@ -208,11 +370,11 @@ function handleAgentWorkMessage(message: AgentClientMessage, ws: WSContext, sess
       cancelled: false
     };
     session.activeRun = activeRun;
-    void handleAgentPlanExecutionMessage(message, ws, session, activeRun, storedPlan);
+    void handleAgentPlanExecutionMessage(message, session, activeRun, storedPlan);
     return;
   }
 
-  sendError(ws, {
+  sendSessionError(session, {
     code: "agent_work_unavailable",
     message: "This Agent action is not available in this build yet.",
     requestId: message.requestId,
@@ -223,7 +385,6 @@ function handleAgentWorkMessage(message: AgentClientMessage, ws: WSContext, sess
 
 async function handleAgentPlanMessage(
   message: Extract<AgentClientMessage, { type: "user_message" }>,
-  ws: WSContext,
   session: AgentSocketSession,
   activeRun: ActiveAgentRun,
   llmConfig: NonNullable<ReturnType<typeof getUsableAgentLlmConfig>>
@@ -234,13 +395,14 @@ async function handleAgentPlanMessage(
       userText: message.text,
       defaults: message.defaults,
       selectedReferences: message.selectedReferences,
+      plannerOptions: message.plannerOptions,
       llmConfig,
       onAssistantDelta: (delta) => {
         if (session.activeRun?.id !== activeRun.id || activeRun.cancelled) {
           return;
         }
 
-        sendEvent(ws, {
+        sendSessionEvent(session, {
           type: "assistant_delta",
           requestId: message.requestId,
           runId: activeRun.id,
@@ -253,7 +415,7 @@ async function handleAgentPlanMessage(
           return;
         }
 
-        sendEvent(ws, {
+        sendSessionEvent(session, {
           type: "assistant_thinking_delta",
           requestId: message.requestId,
           runId: activeRun.id,
@@ -276,16 +438,17 @@ async function handleAgentPlanMessage(
   }
 
   session.activeRun = undefined;
+  scheduleDisconnectedSessionCleanup(session);
 
   if (!result.ok) {
-    sendError(ws, {
+    sendSessionError(session, {
       code: result.code,
       message: result.message,
       requestId: message.requestId,
       runId: activeRun.id,
       recoverable: true
     });
-    sendEvent(ws, {
+    sendSessionEvent(session, {
       type: "run_done",
       requestId: message.requestId,
       runId: activeRun.id,
@@ -300,14 +463,14 @@ async function handleAgentPlanMessage(
     selectedReferences: message.selectedReferences ?? []
   });
 
-  sendEvent(ws, {
+  sendSessionEvent(session, {
     type: "plan_created",
     requestId: message.requestId,
     runId: activeRun.id,
     plan: result.plan,
     timestamp: new Date().toISOString()
   });
-  sendEvent(ws, {
+  sendSessionEvent(session, {
     type: "run_done",
     requestId: message.requestId,
     runId: activeRun.id,
@@ -318,7 +481,6 @@ async function handleAgentPlanMessage(
 
 async function handleAgentPlanExecutionMessage(
   message: Extract<AgentClientMessage, { type: "execute_plan" | "retry_failed" }>,
-  ws: WSContext,
   session: AgentSocketSession,
   activeRun: ActiveAgentRun,
   storedPlan: StoredAgentGenerationPlan
@@ -332,7 +494,7 @@ async function handleAgentPlanExecutionMessage(
       runId: activeRun.id,
       signal: activeRun.controller.signal,
       isRunActive: () => session.activeRun?.id === activeRun.id && !activeRun.cancelled,
-      sendEvent: (event) => sendEvent(ws, event)
+      sendEvent: (event) => sendSessionEvent(session, event)
     });
   } catch (error) {
     if (activeRun.controller.signal.aborted || activeRun.cancelled || session.activeRun?.id !== activeRun.id) {
@@ -340,14 +502,14 @@ async function handleAgentPlanExecutionMessage(
     }
 
     const messageText = error instanceof Error && error.message ? error.message : "Agent plan execution failed.";
-    sendError(ws, {
+    sendSessionError(session, {
       code: "agent_execution_failed",
       message: messageText,
       requestId: message.requestId,
       runId: activeRun.id,
       recoverable: true
     });
-    sendEvent(ws, {
+    sendSessionEvent(session, {
       type: "run_done",
       requestId: message.requestId,
       runId: activeRun.id,
@@ -355,6 +517,7 @@ async function handleAgentPlanExecutionMessage(
       timestamp: new Date().toISOString()
     });
     session.activeRun = undefined;
+    scheduleDisconnectedSessionCleanup(session);
     return;
   }
 
@@ -363,11 +526,12 @@ async function handleAgentPlanExecutionMessage(
   }
 
   session.activeRun = undefined;
+  scheduleDisconnectedSessionCleanup(session);
   session.plans.set(result.plan.id, {
     plan: result.plan,
     selectedReferences: storedPlan.selectedReferences
   });
-  sendEvent(ws, {
+  sendSessionEvent(session, {
     type: "run_done",
     requestId: message.requestId,
     runId: activeRun.id,
@@ -382,14 +546,21 @@ function resolveStoredPlanForExecution(
 ): StoredAgentGenerationPlan | undefined {
   const messagePlan = isExecutableGenerationPlan(message.plan) && message.plan.id === message.planId ? message.plan : undefined;
   const storedPlan = session.plans.get(message.planId);
+  const selectedReferences =
+    message.selectedReferences ?? storedPlan?.selectedReferences ?? (messagePlan ? selectedReferencesFromPlan(messagePlan) : undefined);
 
   if (!messagePlan) {
-    return storedPlan;
+    return storedPlan
+      ? {
+          ...storedPlan,
+          selectedReferences: selectedReferences ?? storedPlan.selectedReferences
+        }
+      : undefined;
   }
 
   return {
     plan: messagePlan,
-    selectedReferences: storedPlan?.selectedReferences ?? selectedReferencesFromPlan(messagePlan)
+    selectedReferences: selectedReferences ?? selectedReferencesFromPlan(messagePlan)
   };
 }
 
@@ -489,23 +660,43 @@ function parseAgentClientMessage(data: WSMessageReceive): ParsedMessage | Messag
   };
 }
 
-function sendError(
-  ws: WSContext,
+function sendSessionError(
+  session: AgentSocketSession,
   input: Omit<AgentErrorEvent, "type" | "timestamp">
 ): void {
-  sendEvent(ws, {
+  sendSessionEvent(session, {
     type: "error",
     timestamp: new Date().toISOString(),
     ...input
   });
 }
 
-function sendEvent(ws: WSContext, event: AgentServerEvent): void {
-  if (ws.readyState !== OPEN_READY_STATE) {
-    return;
+function sendSessionEvent(session: AgentSocketSession, event: AgentServerEvent): void {
+  const ws = session.ws;
+  if (ws) {
+    if (sendDirectEvent(ws, event)) {
+      return;
+    }
+    detachAgentSocket(session, ws, "socket_send_failed");
   }
 
-  ws.send(JSON.stringify(event));
+  session.pendingEvents.push(event);
+  if (session.pendingEvents.length > AGENT_PENDING_EVENT_LIMIT) {
+    session.pendingEvents.splice(0, session.pendingEvents.length - AGENT_PENDING_EVENT_LIMIT);
+  }
+}
+
+function sendDirectEvent(ws: WSContext, event: AgentServerEvent): boolean {
+  if (ws.readyState !== OPEN_READY_STATE) {
+    return false;
+  }
+
+  try {
+    ws.send(JSON.stringify(event));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isAgentClientMessageType(value: string): value is AgentClientMessageType {

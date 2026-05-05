@@ -20,7 +20,7 @@ Local professional AI canvas built with tldraw, Hono, SQLite, and GPT Image 2. V
 
 ## Requirements
 
-- Node.js 22 or newer.
+- Node.js 24.15.0 LTS. The repository includes `.nvmrc` and `.node-version` for version managers.
 - pnpm 9.14.2. The package manager is pinned in `package.json`; Corepack can activate it with `corepack prepare pnpm@9.14.2 --activate`.
 - Docker Desktop or a compatible Docker Engine for the Docker workflow.
 - An OpenAI API key with access to `gpt-image-2`, or a Codex login completed from the app, for live generation. The app can boot without credentials and will show the homepage until a provider is available.
@@ -170,19 +170,19 @@ Open the app at `http://localhost:8787` by default. Set `PORT` in `.env` before 
 
 Docker Compose also sets `SQLITE_JOURNAL_MODE=DELETE` and `SQLITE_LOCKING_MODE=EXCLUSIVE` by default. This avoids SQLite `SQLITE_IOERR_SHMOPEN` failures on bind-mounted `./data` directories in Docker Desktop while preserving projects and generated assets on the host.
 
-The Compose build accepts the same network-related build arguments used by the reference `open-managed-flow` project: `NODE_IMAGE`, `NPM_CONFIG_REGISTRY`, `APT_MIRROR`, and `APT_SECURITY_MIRROR`. The default `NODE_IMAGE` in Compose is `node:23-bullseye-slim` because it satisfies the app's `>=22` runtime requirement and is commonly available as a local cache when Docker Hub is unreachable. To force the exact Node 22 base image, run:
+The Compose build accepts the same network-related build arguments used by the reference `open-managed-flow` project: `NODE_IMAGE`, `NPM_CONFIG_REGISTRY`, `APT_MIRROR`, and `APT_SECURITY_MIRROR`. The default `NODE_IMAGE` in Compose is `node:24.15.0-bookworm-slim`, matching the repository's Node.js 24.15.0 runtime requirement. To override the image explicitly, run:
 
 Windows PowerShell:
 
 ```powershell
-$env:NODE_IMAGE = 'node:22-bookworm-slim'
+$env:NODE_IMAGE = 'node:24.15.0-bookworm-slim'
 docker compose up --build
 ```
 
 macOS/Linux:
 
 ```sh
-NODE_IMAGE=node:22-bookworm-slim docker compose up --build
+NODE_IMAGE=node:24.15.0-bookworm-slim docker compose up --build
 ```
 
 `OPENAI_API_KEY` may be left empty for local boot checks, in-app local provider configuration, or Codex-login based generation. The app still starts; without any available provider, generation endpoints return a `missing_provider` JSON error and the browser opens on the homepage.
@@ -235,7 +235,7 @@ The Docker Compose workflow bind-mounts host `./data` to `/app/data`, so project
 - Agent plan cannot execute: confirm the normal image provider is configured separately from the Agent LLM provider. Plan execution uses the image provider for actual images, and the Agent WebSocket cancels the current run if the browser disconnects.
 - High-resolution generation timeouts: upstream image requests default to 20 minutes; increase `OPENAI_IMAGE_TIMEOUT_MS` or the local provider timeout field if needed.
 - Port already in use: set `PORT` in `.env` for the API/Docker runtime. If Web port `5173` is occupied, stop the process using it, or run `pnpm web:dev -- --port 5174` explicitly and open the printed URL.
-- Docker build cannot pull the Node base image: use a locally cached image with `NODE_IMAGE=node:23-bullseye-slim docker compose up --build` on macOS/Linux or `$env:NODE_IMAGE = 'node:23-bullseye-slim'` followed by `docker compose up --build` in Windows PowerShell, or restore Docker Hub access and rerun `docker compose up --build`.
+- Docker build cannot pull the Node base image: restore Docker Hub access and rerun `docker compose up --build`, or set `NODE_IMAGE` to an equivalent locally cached Node 24.15.0 image.
 - Docker config output includes `.env` values by default. Use `docker compose config --quiet --no-env-resolution` for validation when real credentials are present, and do not share expanded config output.
 - SQLite `SQLITE_IOERR_SHMOPEN` in Docker: keep the Compose defaults `SQLITE_JOURNAL_MODE=DELETE` and `SQLITE_LOCKING_MODE=EXCLUSIVE`, rebuild, and make sure no local API process is using the same `data/` database at the same time.
 - SQLite `SQLITE_CORRUPT`: stop all app processes, back up `data/`, and restore from backup or remove the SQLite files to let the app create a clean database. Generated image files under `data/assets/` can be kept.

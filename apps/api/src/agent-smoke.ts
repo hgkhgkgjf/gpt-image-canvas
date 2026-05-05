@@ -59,6 +59,7 @@ async function smokeAgentWebSocket(port: number): Promise<void> {
     const connected = await probe.next();
     expectEventType(connected, "connected");
     expect(typeof connected.connectionId === "string" && connected.connectionId.length > 0, "connected includes connectionId");
+    const connectionId = String(connected.connectionId);
 
     probe.socket.send(JSON.stringify({ type: "ping", requestId: "ping-1" }));
     const pong = await probe.next();
@@ -90,6 +91,22 @@ async function smokeAgentWebSocket(port: number): Promise<void> {
     const secondCancel = await probe.next();
     expectEventType(secondCancel, "run_cancelled");
     expect(secondCancel.alreadyCancelled === true, "repeated cancel remains idempotent");
+
+    const resumedProbe = await openWebSocketProbe(
+      `ws://127.0.0.1:${port}/api/agent/ws?connectionId=${encodeURIComponent(connectionId)}`
+    );
+    try {
+      const resumedConnected = await resumedProbe.next();
+      expectEventType(resumedConnected, "connected");
+      expect(resumedConnected.connectionId === connectionId, "reconnect resumes the same Agent session");
+
+      resumedProbe.socket.send(JSON.stringify({ type: "ping", requestId: "ping-resumed" }));
+      const resumedPong = await resumedProbe.next();
+      expectEventType(resumedPong, "pong");
+      expect(resumedPong.requestId === "ping-resumed", "resumed socket remains interactive");
+    } finally {
+      resumedProbe.close();
+    }
   } finally {
     probe.close();
   }

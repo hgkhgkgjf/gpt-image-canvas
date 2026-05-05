@@ -6,7 +6,7 @@
   "packageManager": "pnpm@9.14.2",
   "description": "Local professional AI canvas powered by tldraw and GPT Image 2.",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.15.0 <25"
   },
   "scripts": {
     "dev": "concurrently -n api,web -c cyan,magenta \"pnpm api:dev\" \"pnpm web:dev\"",
@@ -17,7 +17,7 @@
     "start": "pnpm --filter @gpt-image-canvas/api start"
   },
   "devDependencies": {
-    "@types/node": "^22.15.3",
+    "@types/node": "^24.12.2",
     "concurrently": "^9.1.2",
     "typescript": "^5.8.3"
   }

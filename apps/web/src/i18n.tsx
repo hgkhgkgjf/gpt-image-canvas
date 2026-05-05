@@ -9,6 +9,7 @@ import {
 } from "react";
 import type {
   GenerationRecord,
+  GenerationPlanStatus,
   GenerationStatus,
   ImageQuality,
   OutputFormat,
@@ -150,6 +151,8 @@ const commonApiErrorMessages: Record<Locale, Record<string, string>> = {
     invalid_prompt: "请输入有效的提示词。",
     invalid_request: "请求内容无效。",
     invalid_size: "请提供有效的图像尺寸。",
+    agent_requires_user_input: "我需要先确认：这次是直接编辑选中的原图，还是生成新的设计图？请补充说明后再发送。",
+    missing_selected_canvas_reference: "请先在画布上选中要编辑的原图，然后再发送这条 Agent 请求。",
     missing_agent_config: "请先配置 Agent LLM。",
     missing_api_key: "服务器缺少可用的 OpenAI API Key。",
     not_found: "找不到请求的资源。",
@@ -166,6 +169,8 @@ const commonApiErrorMessages: Record<Locale, Record<string, string>> = {
     invalid_prompt: "Enter a valid prompt.",
     invalid_request: "The request is invalid.",
     invalid_size: "Provide a valid image size.",
+    agent_requires_user_input: "Please confirm whether the Agent should edit the selected original image(s) directly or generate a new design image.",
+    missing_selected_canvas_reference: "Select the original canvas image(s) to edit, then send this Agent request again.",
     missing_agent_config: "Configure the Agent LLM first.",
     missing_api_key: "The server does not have an available OpenAI API key.",
     not_found: "The requested resource was not found.",
@@ -210,13 +215,32 @@ const zhMessages = {
   agentJobCompleted: ({ jobId }: { jobId: string }) => `${jobId} 已完成。`,
   agentJobFailed: ({ jobId, error }: { jobId: string; error: string }) => `${jobId} 失败：${error}`,
   agentJobStarted: ({ jobId }: { jobId: string }) => `${jobId} 已开始。`,
-  agentMessageRole: ({ role }: { role: "user" | "assistant" | "thinking" | "system" | "error" | "plan" }) =>
-    ({ user: "你", assistant: "Agent", thinking: "思考", system: "状态", error: "错误", plan: "计划" })[role],
+  agentMessageRole: ({ role }: { role: "user" | "assistant" | "thinking" | "system" | "error" | "question" | "plan" }) =>
+    ({ user: "你", assistant: "Agent", thinking: "思考", system: "状态", error: "错误", question: "需要确认", plan: "计划" })[role],
+  agentNewConversation: "新对话",
+  agentCopyMessage: "复制消息",
+  agentCopiedMessage: "已复制",
+  agentCopyMessageFailed: "复制失败，请手动选择文本复制。",
   agentPlanLocate: ({ title }: { title: string }) => `定位画布计划节点：${title}`,
   agentPlanLocateInvalid: "这张计划卡片数据无效，无法定位画布节点。请重新生成计划。",
   agentPlanLocateMalformed: "对应的画布计划节点数据已损坏，已停止定位操作。请重新生成计划。",
   agentPlanLocateMissing: "没有找到对应的画布计划节点。请刷新或重新生成计划后再试。",
   agentPlanCreated: ({ title }: { title: string }) => `已创建计划：${title}`,
+  agentPlanActionBusy: "Agent 正在运行，请先等待或取消当前任务。",
+  agentPlanCancel: "取消执行",
+  agentPlanConfirmationHint: "确认后才会开始生成，计划不会再放到画布上。",
+  agentPlanExecute: "确认生成",
+  agentPlanRetryFailed: "重试失败任务",
+  agentPlanStatus: ({ status }: { status: GenerationPlanStatus }) =>
+    ({
+      awaiting_confirmation: "待确认",
+      confirmed: "已确认",
+      running: "生成中",
+      succeeded: "已完成",
+      partial: "部分完成",
+      failed: "失败",
+      cancelled: "已取消"
+    })[status],
   agentPlanSummary: ({
     finalOutputs,
     jobs,
@@ -232,6 +256,47 @@ const zhMessages = {
     ].filter(Boolean);
     return `${parts.join("，") || "暂未安排输出图"}，${jobs} 个任务`;
   },
+  agentPlanReviewTitle: "确认清单",
+  agentPlanReviewScope: ({ total, jobs }: { total: number; jobs: number }) => `${total} 张图 · ${jobs} 个任务`,
+  agentPlanReviewReferences: ({ count }: { count: number }) => (count > 0 ? `${count} 个参考关系` : "无画布参考"),
+  agentPlanReviewDependencies: ({ count }: { count: number }) => (count > 0 ? `${count} 条依赖` : "无依赖"),
+  agentPlanReviewConfirm: "确认后开始生成",
+  agentPlanDetailsTitle: "计划细节",
+  agentPlanJobLine: ({ id, role, count, status }: { id: string; role: string; count: number; status: string }) =>
+    `${id} · ${role} · ${count} 张 · ${status}`,
+  agentPlanJobPrompt: "提示词",
+  agentPlanJobDependsOn: ({ ids }: { ids: string }) => `依赖：${ids}`,
+  agentPlanJobReferences: ({ references }: { references: string }) => `参考：${references}`,
+  agentPlanJobNoReferences: "无参考",
+  agentPlanReferenceGenerated: ({ jobId }: { jobId: string }) => `生成结果 ${jobId}`,
+  agentPlanReferenceSelected: ({ label }: { label: string }) => `画布参考 ${label}`,
+  agentPlanRoleLabel: ({ role }: { role: string }) =>
+    ({
+      final_image: "最终图",
+      variation: "变体",
+      character_anchor: "角色锚点",
+      style_anchor: "风格锚点",
+      reference_anchor: "参考锚点"
+    } as Record<string, string>)[role] ?? role,
+  agentPlanJobStatusLabel: ({ status }: { status: string }) =>
+    ({
+      queued: "待执行",
+      running: "生成中",
+      succeeded: "已完成",
+      failed: "失败",
+      blocked: "已阻塞",
+      cancelled: "已取消"
+    } as Record<string, string>)[status] ?? status,
+  agentPlanReferenceUsageLabel: ({ usage }: { usage: string }) =>
+    ({
+      subject: "主体",
+      character: "角色",
+      style: "风格",
+      composition: "构图",
+      scene: "场景",
+      product: "产品",
+      other: "参考"
+    } as Record<string, string>)[usage] ?? usage,
   agentPlanUpdated: ({ title }: { title: string }) => `计划已更新：${title}`,
   agentPlanUnreadableCard: "这张计划卡片数据不完整，已安全停止定位操作。",
   agentPlanUnreadableTitle: "计划卡片无法读取",
@@ -249,6 +314,7 @@ const zhMessages = {
   agentReferenceTooMany: ({ count, max }: { count: number; max: number }) =>
     `当前选中 ${count} 张图片，Agent 本次只会使用前 ${max} 张。`,
   agentReferenceUnreadableSkipped: ({ count }: { count: number }) => `已跳过 ${count} 张无法读取的图片。`,
+  agentUsingRecentOutputs: ({ count }: { count: number }) => `已使用上一轮 ${count} 张 Agent 输出作为编辑源。`,
   agentRunAlreadyCancelled: "当前没有可取消的 Agent 运行。",
   agentRunCancelled: "已取消 Agent 运行。",
   agentRunDone: ({ status }: { status: "succeeded" | "failed" | "cancelled" }) =>
@@ -496,11 +562,13 @@ const zhMessages = {
   providerMoveDown: ({ source }: { source: string }) => `下移${source}`,
   providerMoveUp: ({ source }: { source: string }) => `上移${source}`,
   providerNoReason: "无",
-  providerPriorityNote: "按顺序选择第一个已配置且可用的来源；上游请求已经发出后不会自动切换到下一个来源。",
+  providerPriorityNote: "按优先级选择第一个可用来源，请求发出后不会自动切换。",
   providerPriorityTitle: "路由",
   providerRefresh: "刷新",
   providerSave: "保存",
   providerSavedSecret: ({ mask }: { mask: string }) => `已保存 ${mask}`,
+  providerSourcesNote: "查看各来源的状态与关键参数。",
+  providerSourcesTitle: "来源详情",
   providerSourceConfigured: "已配置，可参与生成",
   providerSourceMissingCodex: "未登录 Codex 或会话不可用",
   providerSourceMissingKey: "未保存本地 API Key",
@@ -600,12 +668,31 @@ const enMessages: I18nMessages = {
   agentJobCompleted: ({ jobId }) => `${jobId} completed.`,
   agentJobFailed: ({ jobId, error }) => `${jobId} failed: ${error}`,
   agentJobStarted: ({ jobId }) => `${jobId} started.`,
-  agentMessageRole: ({ role }) => ({ user: "You", assistant: "Agent", thinking: "Thinking", system: "Status", error: "Error", plan: "Plan" })[role],
+  agentMessageRole: ({ role }) => ({ user: "You", assistant: "Agent", thinking: "Thinking", system: "Status", error: "Error", question: "Needs input", plan: "Plan" })[role],
+  agentNewConversation: "New conversation",
+  agentCopyMessage: "Copy message",
+  agentCopiedMessage: "Copied",
+  agentCopyMessageFailed: "Unable to copy this message. Select the text and copy it manually.",
   agentPlanLocate: ({ title }) => `Locate canvas plan node: ${title}`,
   agentPlanLocateInvalid: "This plan card has invalid data, so the canvas node was not located. Generate the plan again.",
   agentPlanLocateMalformed: "The matching canvas plan node has malformed data, so locating stopped. Generate the plan again.",
   agentPlanLocateMissing: "The matching canvas plan node was not found. Refresh or generate the plan again.",
   agentPlanCreated: ({ title }) => `Plan created: ${title}`,
+  agentPlanActionBusy: "The Agent is already running. Wait for it to finish or cancel the current run first.",
+  agentPlanCancel: "Cancel run",
+  agentPlanConfirmationHint: "Generation starts only after you confirm. Plans stay in this conversation, not on the canvas.",
+  agentPlanExecute: "Confirm generation",
+  agentPlanRetryFailed: "Retry failed jobs",
+  agentPlanStatus: ({ status }) =>
+    ({
+      awaiting_confirmation: "Awaiting confirmation",
+      confirmed: "Confirmed",
+      running: "Running",
+      succeeded: "Complete",
+      partial: "Partially complete",
+      failed: "Failed",
+      cancelled: "Cancelled"
+    })[status],
   agentPlanSummary: ({ finalOutputs, jobs, supportOutputs }) => {
     const parts = [
       finalOutputs > 0 ? `${finalOutputs} final ${finalOutputs === 1 ? "image" : "images"}` : "",
@@ -613,6 +700,46 @@ const enMessages: I18nMessages = {
     ].filter(Boolean);
     return `${parts.join(", ") || "no output images planned"}, ${jobs} ${jobs === 1 ? "job" : "jobs"}`;
   },
+  agentPlanReviewTitle: "Review checklist",
+  agentPlanReviewScope: ({ total, jobs }) => `${total} ${total === 1 ? "image" : "images"} · ${jobs} ${jobs === 1 ? "job" : "jobs"}`,
+  agentPlanReviewReferences: ({ count }) => (count > 0 ? `${count} reference ${count === 1 ? "link" : "links"}` : "No canvas references"),
+  agentPlanReviewDependencies: ({ count }) => (count > 0 ? `${count} ${count === 1 ? "dependency" : "dependencies"}` : "No dependencies"),
+  agentPlanReviewConfirm: "Confirm to start generation",
+  agentPlanDetailsTitle: "Plan details",
+  agentPlanJobLine: ({ id, role, count, status }) => `${id} · ${role} · ${count} ${count === 1 ? "image" : "images"} · ${status}`,
+  agentPlanJobPrompt: "Prompt",
+  agentPlanJobDependsOn: ({ ids }) => `Depends on: ${ids}`,
+  agentPlanJobReferences: ({ references }) => `References: ${references}`,
+  agentPlanJobNoReferences: "No references",
+  agentPlanReferenceGenerated: ({ jobId }) => `Generated output ${jobId}`,
+  agentPlanReferenceSelected: ({ label }) => `Canvas reference ${label}`,
+  agentPlanRoleLabel: ({ role }) =>
+    ({
+      final_image: "Final image",
+      variation: "Variation",
+      character_anchor: "Character anchor",
+      style_anchor: "Style anchor",
+      reference_anchor: "Reference anchor"
+    } as Record<string, string>)[role] ?? role,
+  agentPlanJobStatusLabel: ({ status }) =>
+    ({
+      queued: "Queued",
+      running: "Running",
+      succeeded: "Complete",
+      failed: "Failed",
+      blocked: "Blocked",
+      cancelled: "Cancelled"
+    } as Record<string, string>)[status] ?? status,
+  agentPlanReferenceUsageLabel: ({ usage }) =>
+    ({
+      subject: "Subject",
+      character: "Character",
+      style: "Style",
+      composition: "Composition",
+      scene: "Scene",
+      product: "Product",
+      other: "Reference"
+    } as Record<string, string>)[usage] ?? usage,
   agentPlanUpdated: ({ title }) => `Plan updated: ${title}`,
   agentPlanUnreadableCard: "This plan card is incomplete, so locating stopped safely.",
   agentPlanUnreadableTitle: "Plan card unreadable",
@@ -629,6 +756,7 @@ const enMessages: I18nMessages = {
   agentReferencesTitle: "Selected references",
   agentReferenceTooMany: ({ count, max }) => `${count} images selected. Agent will use only the first ${max}.`,
   agentReferenceUnreadableSkipped: ({ count }) => `${count} unreadable images skipped.`,
+  agentUsingRecentOutputs: ({ count }) => `Using ${count} images from the previous Agent output as edit sources.`,
   agentRunAlreadyCancelled: "No active Agent run to cancel.",
   agentRunCancelled: "Agent run cancelled.",
   agentRunDone: ({ status }) => ({ succeeded: "Agent run complete.", failed: "Agent run failed.", cancelled: "Agent run cancelled." })[status],
@@ -872,11 +1000,13 @@ const enMessages: I18nMessages = {
   providerMoveDown: ({ source }) => `Move ${source} down`,
   providerMoveUp: ({ source }) => `Move ${source} up`,
   providerNoReason: "None",
-  providerPriorityNote: "The first configured and available source is selected in order; in-flight upstream requests do not automatically fail over.",
+  providerPriorityNote: "Requests use the first available source in priority order and do not fail over mid-flight.",
   providerPriorityTitle: "Route",
   providerRefresh: "Refresh",
   providerSave: "Save",
   providerSavedSecret: ({ mask }) => `Saved ${mask}`,
+  providerSourcesNote: "Current status and key settings for each source.",
+  providerSourcesTitle: "Source details",
   providerSourceConfigured: "Configured and available for generation",
   providerSourceMissingCodex: "Not signed in to Codex or the session is unavailable",
   providerSourceMissingKey: "No local API key saved",

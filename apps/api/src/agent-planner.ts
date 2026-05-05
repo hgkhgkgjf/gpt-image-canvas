@@ -7,13 +7,17 @@ import {
   GENERATION_COUNTS,
   GENERATION_PLAN_SCHEMA_VERSION,
   IMAGE_QUALITIES,
+  MAX_AGENT_SELECTED_REFERENCES,
   MAX_GENERATION_JOB_REFERENCES,
   MAX_GENERATION_PLAN_IMAGES,
   MAX_REFERENCE_IMAGES,
   OUTPUT_FORMATS,
   STYLE_PRESETS,
   validateSceneImageSize,
+  type AgentPlannerOptions,
+  type AgentReasoningEffort,
   type AgentSelectedCanvasReference,
+  type AgentThinkingType,
   type GenerationCount,
   type GenerationDependencyEdge,
   type GenerationJob,
@@ -106,6 +110,7 @@ export interface AgentPlannerInput {
   userText: string;
   defaults?: unknown;
   selectedReferences?: unknown;
+  plannerOptions?: unknown;
   llmConfig: UsableAgentLlmConfig;
   onAssistantDelta?: (delta: string) => void;
   onThinkingDelta?: (delta: string) => void;
@@ -168,8 +173,15 @@ export async function createGenerationPlan(input: AgentPlannerInput): Promise<Ag
   }
 
   const selectedReferences = selectedReferencesResult.references;
-  const runner = input.runner ?? createDeepAgentsPlanner(input.llmConfig);
+  const selectedReferenceRequestIssue = validateSelectedReferenceEditRequest(userText, selectedReferences);
+  if (selectedReferenceRequestIssue) {
+    return selectedReferenceRequestIssue;
+  }
+
+  const plannerOptions = normalizeAgentPlannerOptions(input.plannerOptions);
+  const runner = input.runner ?? createDeepAgentsPlanner(input.llmConfig, plannerOptions);
   const now = input.now ?? new Date();
+  const planId = `plan-${randomUUID()}`;
   const message = buildPlannerUserMessage({
     userText,
     defaults: defaultsResult.defaults,
@@ -230,10 +242,30 @@ export async function createGenerationPlan(input: AgentPlannerInput): Promise<Ag
     };
   }
 
+  const userQuestion = parsePlannerUserQuestionModelOutput(modelText);
+  if (userQuestion) {
+    const fallbackPlan = createSelectedReferenceEditFallbackPlan({
+      userText,
+      defaults: defaultsResult.defaults,
+      selectedReferences,
+      now,
+      planId
+    });
+    if (fallbackPlan) {
+      emitAssistantDelta(input.onAssistantDelta, ["Plan created. Review the confirmation card and run it when ready."]);
+      return {
+        ok: true,
+        plan: fallbackPlan
+      };
+    }
+    return userQuestion;
+  }
+
   const validated = parseGenerationPlanModelOutput(modelText, {
     defaults: defaultsResult.defaults,
     selectedReferences,
-    now
+    now,
+    planId
   });
 
   if (!validated.ok) {
@@ -245,7 +277,29 @@ export async function createGenerationPlan(input: AgentPlannerInput): Promise<Ag
     };
   }
 
-  emitAssistantDelta(input.onAssistantDelta, ["计划已生成，你可以在画布节点中检查并执行。"]);
+  const selectedReferenceEditIssue = validateSelectedReferenceEditPlan(validated.plan, {
+    userText,
+    selectedReferences
+  });
+  if (selectedReferenceEditIssue) {
+    const fallbackPlan = createSelectedReferenceEditFallbackPlan({
+      userText,
+      defaults: defaultsResult.defaults,
+      selectedReferences,
+      now,
+      planId
+    });
+    if (fallbackPlan) {
+      emitAssistantDelta(input.onAssistantDelta, ["Plan created. Review the confirmation card and run it when ready."]);
+      return {
+        ok: true,
+        plan: fallbackPlan
+      };
+    }
+    return selectedReferenceEditIssue;
+  }
+
+  emitAssistantDelta(input.onAssistantDelta, ["计划已生成，请在对话卡片中检查细节并确认执行。"]);
 
   return {
     ok: true,
@@ -271,9 +325,9 @@ function emitAssistantDelta(onAssistantDelta: AgentPlannerInput["onAssistantDelt
   }
 }
 
-export function createDeepAgentsPlanner(config: UsableAgentLlmConfig): GenerationPlanAgentRunner {
+export function createDeepAgentsPlanner(config: UsableAgentLlmConfig, plannerOptions?: AgentPlannerOptions): GenerationPlanAgentRunner {
   const isDeepSeek = isDeepSeekAgentConfig(config);
-  const model = createAgentChatModel(config, isDeepSeek);
+  const model = createAgentChatModel(config, isDeepSeek, plannerOptions);
 
   if (isDeepSeek) {
     return createDirectChatPlanner(model);
@@ -287,8 +341,12 @@ export function createDeepAgentsPlanner(config: UsableAgentLlmConfig): Generatio
   }) as unknown as GenerationPlanAgentRunner;
 }
 
-function createAgentChatModel(config: UsableAgentLlmConfig, isDeepSeek = isDeepSeekAgentConfig(config)): ChatOpenAI {
-  const modelKwargs = agentModelKwargsForConfig(config);
+function createAgentChatModel(
+  config: UsableAgentLlmConfig,
+  isDeepSeek = isDeepSeekAgentConfig(config),
+  plannerOptions?: AgentPlannerOptions
+): ChatOpenAI {
+  const modelKwargs = agentModelKwargsForConfig(config, plannerOptions);
   return new ChatOpenAI({
     apiKey: config.apiKey,
     configuration: config.baseUrl ? { baseURL: config.baseUrl } : undefined,
@@ -380,17 +438,66 @@ function createDirectPlanningSystemPrompt(): string {
   ].join("\n\n");
 }
 
-export function agentModelKwargsForConfig(config: Pick<UsableAgentLlmConfig, "baseUrl" | "model">): Record<string, unknown> {
+export function agentModelKwargsForConfig(
+  config: Pick<UsableAgentLlmConfig, "baseUrl" | "model">,
+  plannerOptions?: AgentPlannerOptions
+): Record<string, unknown> {
   if (!isDeepSeekAgentConfig(config)) {
     return {};
   }
 
+  const thinkingType = plannerOptions?.thinking?.type ?? "enabled";
+  if (thinkingType === "disabled") {
+    return {
+      extra_body: {
+        thinking: {
+          type: "disabled"
+        }
+      }
+    };
+  }
+
   return {
-    thinking: {
-      type: "enabled"
+    extra_body: {
+      thinking: {
+        type: "enabled"
+      }
     },
-    reasoning_effort: "high"
+    reasoning_effort: plannerOptions?.reasoningEffort ?? "high"
   };
+}
+
+function normalizeAgentPlannerOptions(input: unknown): AgentPlannerOptions | undefined {
+  if (!isRecord(input)) {
+    return undefined;
+  }
+
+  const thinkingType = parseAgentThinkingType(input.thinking);
+  const reasoningEffort = parseAgentReasoningEffort(input.reasoningEffort);
+  if (!thinkingType && !reasoningEffort) {
+    return undefined;
+  }
+
+  return {
+    thinking: thinkingType
+      ? {
+          type: thinkingType
+        }
+      : undefined,
+    reasoningEffort
+  };
+}
+
+function parseAgentThinkingType(input: unknown): AgentThinkingType | undefined {
+  if (isRecord(input) && typeof input.type === "string") {
+    return input.type === "enabled" || input.type === "disabled" ? input.type : undefined;
+  }
+
+  return undefined;
+}
+
+function parseAgentReasoningEffort(input: unknown): AgentReasoningEffort | undefined {
+  return input === "high" || input === "max" ? input : undefined;
 }
 
 function isDeepSeekAgentConfig(config: Pick<UsableAgentLlmConfig, "baseUrl" | "model">): boolean {
@@ -465,11 +572,11 @@ export function parseSelectedCanvasReferences(
     };
   }
 
-  if (input.length > MAX_REFERENCE_IMAGES) {
+  if (input.length > MAX_AGENT_SELECTED_REFERENCES) {
     return {
       ok: false,
       code: "too_many_selected_references",
-      message: `Select at most ${MAX_REFERENCE_IMAGES} canvas references for Agent planning.`
+      message: `Select at most ${MAX_AGENT_SELECTED_REFERENCES} canvas references for Agent planning.`
     };
   }
 
@@ -523,14 +630,24 @@ export function buildPlannerUserMessage(input: {
     `User request:\n${input.userText.trim()}`,
     `Current Agent defaults:\n${JSON.stringify(input.defaults)}`,
     `supportsVision: ${input.supportsVision ? "true" : "false"}`,
+    'Allowed quality values: "auto", "low", "medium", "high". Allowed outputFormat values: "png", "jpeg", "webp". Omit job quality/outputFormat when using defaults.',
     referenceSummaries.length > 0
-      ? `Selected canvas references, capped at ${MAX_REFERENCE_IMAGES}:\n${referenceSummaries.join("\n")}`
+      ? `Selected canvas references, capped at ${MAX_AGENT_SELECTED_REFERENCES}:\n${referenceSummaries.join("\n")}`
       : "Selected canvas references: none",
+    referenceSummaries.length > 0
+      ? 'When a job uses a selected_canvas_image reference, set assetId to one of the listed handles such as "ref1", the listed id, or the listed assetId.'
+      : "Do not create selected_canvas_image references because no canvas references are selected.",
+    referenceSummaries.length > 0 && hasSelectedReferenceEditIntent(input.userText, input.selectedReferences.length)
+      ? "Selected-image edit mode: the user is asking to work on the selected/original image(s). Preserve those images as the source. Create edit jobs with selected_canvas_image references; for each/every selected image, create one final_image job per ref with count 1 and exactly one selected_canvas_image reference. Prompts must say to edit the original directly and must forbid blank poster templates, generic geometric backgrounds, or unrelated replacement images."
+      : "",
+    referenceSummaries.length === 0 && hasSelectedReferenceEditIntent(input.userText, 0)
+      ? 'The request appears to depend on original/selected canvas images, but none are selected. Return an AgentUserQuestion with code "missing_selected_canvas_reference".'
+      : "",
     input.supportsVision
       ? "Vision mode: image data may be attached below when dataUrl is available."
       : "No-vision mode: selected images are reference handles only. Do not claim visual inspection or describe unseen image contents.",
-    "Return only strict GenerationPlan JSON."
-  ].join("\n\n");
+    "Return only the strict JSON object described by the planning skill."
+  ].filter(Boolean).join("\n\n");
 
   const imageBlocks = input.supportsVision
     ? input.selectedReferences
@@ -582,6 +699,240 @@ export function parseGenerationPlanModelOutput(
   }
 
   return validateGenerationPlan(parsed.value, context);
+}
+
+function parsePlannerUserQuestionModelOutput(outputText: string): AgentPlannerFailure | undefined {
+  const parsed = parseStrictJsonObject(outputText);
+  if (!parsed.ok || !isRecord(parsed.value)) {
+    return undefined;
+  }
+
+  const kind = normalizedOptionToken(parsed.value.kind ?? parsed.value.type);
+  if (kind !== "agentuserquestion" && kind !== "userquestion" && kind !== "requiresuserinput") {
+    return undefined;
+  }
+
+  const rawCode = stringValue(parsed.value.code);
+  const code =
+    rawCode === "missing_selected_canvas_reference" || rawCode === "agent_requires_user_input"
+      ? rawCode
+      : "agent_requires_user_input";
+  const message =
+    stringValue(parsed.value.message ?? parsed.value.question ?? parsed.value.prompt) ??
+    defaultAgentUserInputMessage(code);
+
+  return {
+    ok: false,
+    code,
+    message
+  };
+}
+
+function createSelectedReferenceEditFallbackPlan(input: {
+  userText: string;
+  defaults: GenerationPlanDefaults;
+  selectedReferences: AgentSelectedCanvasReference[];
+  now: Date;
+  planId: string;
+}): GenerationPlan | undefined {
+  const intent = selectedReferenceEditIntent(input.userText, input.selectedReferences.length);
+  if (!intent.requiresSelectedImageEdit || input.selectedReferences.length === 0) {
+    return undefined;
+  }
+
+  const timestamp = input.now.toISOString();
+  const references = input.selectedReferences.slice(0, MAX_AGENT_SELECTED_REFERENCES);
+  if (intent.allowsCombinedReferences && intent.requiresSingleCombinedOutput && references.length > MAX_REFERENCE_IMAGES) {
+    return undefined;
+  }
+
+  const jobs: GenerationJob[] = intent.allowsCombinedReferences
+    ? [
+        {
+          id: "edit_selected_combined",
+          role: "final_image",
+          prompt: selectedReferenceFallbackPrompt(input.userText, "Edit the selected canvas images together"),
+          count: 1,
+          references: references.map((reference) => selectedReferenceForFallbackJob(reference)),
+          status: "queued",
+          outputs: [],
+          visible: true
+        }
+      ]
+    : references.map((reference, index) => ({
+        id: `edit_selected_${index + 1}`,
+        role: "final_image",
+        prompt: selectedReferenceFallbackPrompt(
+          input.userText,
+          `Edit selected canvas image ref${index + 1} directly`
+        ),
+        count: 1,
+        references: [selectedReferenceForFallbackJob(reference)],
+        status: "queued",
+        outputs: [],
+        visible: true
+      }));
+
+  return {
+    schemaVersion: GENERATION_PLAN_SCHEMA_VERSION,
+    id: input.planId,
+    title: references.length > 1 ? "Edit selected images" : "Edit selected image",
+    status: "awaiting_confirmation",
+    defaults: input.defaults,
+    jobs,
+    edges: [],
+    createdBy: "agent",
+    createdAt: timestamp,
+    updatedAt: timestamp
+  };
+}
+
+function validateSelectedReferenceEditRequest(
+  userText: string,
+  selectedReferences: AgentSelectedCanvasReference[]
+): AgentPlannerFailure | undefined {
+  const intent = selectedReferenceEditIntent(userText, selectedReferences.length);
+  if (
+    !intent.requiresSelectedImageEdit ||
+    !intent.allowsCombinedReferences ||
+    !intent.requiresSingleCombinedOutput ||
+    selectedReferences.length <= MAX_REFERENCE_IMAGES
+  ) {
+    return undefined;
+  }
+
+  return {
+    ok: false,
+    code: "agent_requires_user_input",
+    message: `This request asks to combine ${selectedReferences.length} selected images into one output, but each edit job supports at most ${MAX_REFERENCE_IMAGES} reference images. Select ${MAX_REFERENCE_IMAGES} or fewer images, or ask the Agent to split them into multiple outputs.`
+  };
+}
+
+function selectedReferenceForFallbackJob(reference: AgentSelectedCanvasReference): GenerationReference {
+  return {
+    kind: "selected_canvas_image",
+    usage: "scene",
+    assetId: reference.assetId,
+    label: reference.label
+  };
+}
+
+function selectedReferenceFallbackPrompt(userText: string, action: string): string {
+  return [
+    `${action} according to the user request: ${userText}`,
+    "Preserve the original image content, composition, perspective, and main subjects.",
+    "Add only the requested text/design treatment on top.",
+    "Do not create a blank poster template, generic geometric background, or unrelated replacement image."
+  ].join(" ");
+}
+
+function validateSelectedReferenceEditPlan(
+  plan: GenerationPlan,
+  input: {
+    userText: string;
+    selectedReferences: AgentSelectedCanvasReference[];
+  }
+): AgentPlannerFailure | undefined {
+  const intent = selectedReferenceEditIntent(input.userText, input.selectedReferences.length);
+  if (!intent.requiresSelectedImageEdit) {
+    return undefined;
+  }
+
+  if (input.selectedReferences.length === 0) {
+    return {
+      ok: false,
+      code: "missing_selected_canvas_reference",
+      message: defaultAgentUserInputMessage("missing_selected_canvas_reference")
+    };
+  }
+
+  const finalSelectedReferenceAssetIds = selectedReferenceAssetIdsForFinalJobs(plan);
+  if (finalSelectedReferenceAssetIds.size === 0) {
+    return {
+      ok: false,
+      code: "agent_requires_user_input",
+      message: defaultAgentUserInputMessage("agent_requires_user_input")
+    };
+  }
+
+  if (!intent.requiresEverySelectedReference || intent.allowsCombinedReferences) {
+    return undefined;
+  }
+
+  const missingReferences = input.selectedReferences.filter(
+    (reference) => !finalSelectedReferenceAssetIds.has(reference.assetId)
+  );
+  if (missingReferences.length === 0) {
+    return undefined;
+  }
+
+  return {
+    ok: false,
+    code: "agent_requires_user_input",
+    message: `Agent needs a plan that covers every selected image. Missing: ${missingReferences
+      .map((reference, index) => reference.label ?? reference.assetId ?? `ref${index + 1}`)
+      .join(", ")}.`
+  };
+}
+
+function selectedReferenceAssetIdsForFinalJobs(plan: GenerationPlan): Set<string> {
+  const assetIds = new Set<string>();
+  for (const job of plan.jobs) {
+    if (job.role !== "final_image") {
+      continue;
+    }
+    for (const reference of job.references) {
+      if (reference.kind === "selected_canvas_image" && reference.assetId) {
+        assetIds.add(reference.assetId);
+      }
+    }
+  }
+
+  return assetIds;
+}
+
+function selectedReferenceEditIntent(
+  userText: string,
+  selectedReferenceCount: number
+): {
+  requiresSelectedImageEdit: boolean;
+  requiresEverySelectedReference: boolean;
+  allowsCombinedReferences: boolean;
+  requiresSingleCombinedOutput: boolean;
+} {
+  const text = normalizeIntentText(userText);
+  const hasSelectedContext =
+    selectedReferenceCount > 0 ||
+    /原图|原始图|原本|选中|当前图|这张图|这些图|图片上|图上|画面上|每张图|每一张|所有图|全部图|selected image|selected images|original image|source image|current image|each image|every image|all selected/u.test(text);
+  const hasEditAction =
+    /编辑|修改|调整|改成|改为|优化|润色|重绘|修图|保留|基于|基础上|加字|加上字|加文字|配字|配上字|配文字|配上文字|配文|文案|标题|字幕|字标|字体|排版|贴字|一致|统一|edit|modify|retouch|polish|redesign|based on|from the original|add text|text overlay|caption|title|typography|copy|font|consistent|unify/u.test(text);
+  const requiresEverySelectedReference =
+    /每张|每一张|每个|每一个|所有选中|全部选中|所有图|全部图|each image|every image|all selected|all images|for each/u.test(text);
+  const allowsCombinedReferences =
+    /组合|合成|拼贴|拼成|融合|放在一起|对比|一张海报|combine|merge|collage|montage|together|one poster|single poster|comparison/u.test(text);
+  const requiresSingleCombinedOutput =
+    /合成一张|拼成一张|做成一张|一张图|一张海报|one image|single image|one poster|single poster/u.test(text);
+
+  return {
+    requiresSelectedImageEdit: hasSelectedContext && (hasEditAction || allowsCombinedReferences),
+    requiresEverySelectedReference,
+    allowsCombinedReferences,
+    requiresSingleCombinedOutput
+  };
+}
+
+function hasSelectedReferenceEditIntent(userText: string, selectedReferenceCount = 0): boolean {
+  return selectedReferenceEditIntent(userText, selectedReferenceCount).requiresSelectedImageEdit;
+}
+
+function normalizeIntentText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/gu, " ");
+}
+
+function defaultAgentUserInputMessage(code: "missing_selected_canvas_reference" | "agent_requires_user_input"): string {
+  return code === "missing_selected_canvas_reference"
+    ? "Please select the original canvas image(s) to edit, then send the Agent request again."
+    : "Please confirm whether the Agent should edit the selected original image(s) directly or generate a new design image.";
 }
 
 export function validateGenerationPlan(
@@ -809,14 +1160,8 @@ function parsePlanDefaultsFromPlan(
   }
 
   const quality = parseQuality(input.quality);
-  if (input.quality !== undefined && !quality) {
-    issues.push(issue("invalid_plan_defaults", "Plan default quality is unsupported.", "defaults.quality"));
-  }
 
   const outputFormat = parseOutputFormat(input.outputFormat);
-  if (input.outputFormat !== undefined && !outputFormat) {
-    issues.push(issue("invalid_plan_defaults", "Plan default outputFormat is unsupported.", "defaults.outputFormat"));
-  }
 
   const count = parseGenerationCount(input.count);
   if (input.count !== undefined && !count) {
@@ -896,16 +1241,10 @@ function parsePlanJobs(
     }
 
     const quality = rawJob.quality === undefined ? undefined : parseQuality(rawJob.quality);
-    if (rawJob.quality !== undefined && !quality) {
-      issues.push(issue("invalid_plan_job", "GenerationJob quality is unsupported.", `${path}.quality`));
-    }
 
     const outputFormat = rawJob.outputFormat === undefined ? undefined : parseOutputFormat(rawJob.outputFormat);
-    if (rawJob.outputFormat !== undefined && !outputFormat) {
-      issues.push(issue("invalid_plan_job", "GenerationJob outputFormat is unsupported.", `${path}.outputFormat`));
-    }
 
-    const references = parseJobReferences(rawJob.references, `${path}.references`, issues);
+    const references = parseJobReferences(rawJob.references, `${path}.references`, context.selectedReferences ?? [], issues);
     const visible = rawJob.visible === undefined ? true : rawJob.visible === true;
     if (rawJob.visible !== undefined && typeof rawJob.visible !== "boolean") {
       issues.push(issue("invalid_plan_job", "GenerationJob visible must be boolean.", `${path}.visible`));
@@ -971,6 +1310,7 @@ function parsePlanJobs(
 function parseJobReferences(
   input: unknown,
   path: string,
+  selectedReferences: AgentSelectedCanvasReference[],
   issues: GenerationPlanValidationIssue[]
 ): GenerationReference[] {
   if (input === undefined) {
@@ -990,7 +1330,10 @@ function parseJobReferences(
       continue;
     }
 
-    const kind = parseReferenceKind(rawReference.kind ?? rawReference.type);
+    const normalizedSelectedReference = normalizeSelectedCanvasReference(rawReference, selectedReferences);
+    const kind =
+      parseReferenceKind(rawReference.kind ?? rawReference.type) ??
+      inferReferenceKind(rawReference, normalizedSelectedReference);
     if (!kind) {
       issues.push(issue("invalid_plan_reference", "GenerationReference kind is unsupported.", `${referencePath}.kind`));
     }
@@ -1000,17 +1343,155 @@ function parseJobReferences(
       issues.push(issue("invalid_plan_reference", "GenerationReference usage is unsupported.", `${referencePath}.usage`));
     }
 
+    const referenceKind = kind ?? "selected_canvas_image";
+    const selectedReference = referenceKind === "selected_canvas_image" ? normalizedSelectedReference : undefined;
+    if (referenceKind === "selected_canvas_image" && selectedReferences.length === 0 && !selectedReference) {
+      continue;
+    }
+
     references.push({
-      kind: kind ?? "selected_canvas_image",
+      kind: referenceKind,
       usage,
-      assetId: stringValue(rawReference.assetId ?? rawReference.id),
+      assetId: selectedReference?.assetId ?? stringValue(rawReference.assetId ?? rawReference.id),
       jobId: stringValue(rawReference.jobId ?? rawReference.sourceJobId ?? rawReference.fromJobId),
       outputId: stringValue(rawReference.outputId),
-      label: stringValue(rawReference.label)
+      label: stringValue(rawReference.label) ?? selectedReference?.label
     });
   }
 
   return references;
+}
+
+function inferReferenceKind(
+  rawReference: Record<string, unknown>,
+  normalizedSelectedReference: AgentSelectedCanvasReference | undefined
+): GenerationReferenceKind | undefined {
+  if (
+    stringValue(rawReference.jobId ?? rawReference.sourceJobId ?? rawReference.fromJobId) ||
+    stringValue(rawReference.outputId)
+  ) {
+    return "generated_output";
+  }
+
+  if (normalizedSelectedReference || selectedReferenceAliasCandidates(rawReference).length > 0) {
+    return "selected_canvas_image";
+  }
+
+  return undefined;
+}
+
+function normalizeSelectedCanvasReference(
+  rawReference: Record<string, unknown>,
+  selectedReferences: AgentSelectedCanvasReference[]
+): AgentSelectedCanvasReference | undefined {
+  if (selectedReferences.length === 0) {
+    return undefined;
+  }
+
+  const aliases = createSelectedReferenceAliasMap(selectedReferences);
+  for (const candidate of selectedReferenceAliasCandidates(rawReference)) {
+    const aliasKey = normalizeReferenceAliasKey(candidate);
+    const selectedReference = aliases.get(aliasKey);
+    if (selectedReference) {
+      return selectedReference;
+    }
+    if (isGenericSelectedReferenceAlias(aliasKey)) {
+      return selectedReferences[0];
+    }
+  }
+
+  return selectedReferences[0];
+}
+
+function createSelectedReferenceAliasMap(
+  selectedReferences: AgentSelectedCanvasReference[]
+): Map<string, AgentSelectedCanvasReference> {
+  const aliases = new Map<string, AgentSelectedCanvasReference>();
+  selectedReferences.forEach((reference, index) => {
+    const position = index + 1;
+    addSelectedReferenceAlias(aliases, reference, reference.id);
+    addSelectedReferenceAlias(aliases, reference, reference.assetId);
+    addSelectedReferenceAlias(aliases, reference, reference.label);
+    addSelectedReferenceAlias(aliases, reference, `${position}`);
+    addSelectedReferenceAlias(aliases, reference, `ref${position}`);
+    addSelectedReferenceAlias(aliases, reference, `ref-${position}`);
+    addSelectedReferenceAlias(aliases, reference, `ref_${position}`);
+    addSelectedReferenceAlias(aliases, reference, `reference-${position}`);
+    addSelectedReferenceAlias(aliases, reference, `reference_${position}`);
+    addSelectedReferenceAlias(aliases, reference, `selected-${position}`);
+    addSelectedReferenceAlias(aliases, reference, `selected_${position}`);
+    addSelectedReferenceAlias(aliases, reference, `canvas-image-${position}`);
+    addSelectedReferenceAlias(aliases, reference, `canvas_image_${position}`);
+    addSelectedReferenceAlias(aliases, reference, `selected-canvas-image-${position}`);
+    addSelectedReferenceAlias(aliases, reference, `selected_canvas_image_${position}`);
+  });
+
+  if (selectedReferences.length === 1) {
+    const [reference] = selectedReferences;
+    addSelectedReferenceAlias(aliases, reference, "ref");
+    addSelectedReferenceAlias(aliases, reference, "reference");
+    addSelectedReferenceAlias(aliases, reference, "selected");
+    addSelectedReferenceAlias(aliases, reference, "selected image");
+    addSelectedReferenceAlias(aliases, reference, "selected_image");
+    addSelectedReferenceAlias(aliases, reference, "selected canvas image");
+    addSelectedReferenceAlias(aliases, reference, "selected_canvas_image");
+    addSelectedReferenceAlias(aliases, reference, "canvas reference");
+    addSelectedReferenceAlias(aliases, reference, "canvas_reference");
+  }
+
+  return aliases;
+}
+
+function addSelectedReferenceAlias(
+  aliases: Map<string, AgentSelectedCanvasReference>,
+  reference: AgentSelectedCanvasReference,
+  value: string | undefined
+): void {
+  const key = normalizeReferenceAliasKey(value);
+  if (key && !aliases.has(key)) {
+    aliases.set(key, reference);
+  }
+}
+
+function selectedReferenceAliasCandidates(rawReference: Record<string, unknown>): string[] {
+  const candidates = [
+    stringValue(rawReference.assetId),
+    stringValue(rawReference.id),
+    stringValue(rawReference.referenceId),
+    stringValue(rawReference.referenceAssetId),
+    stringValue(rawReference.selectedReferenceId),
+    stringValue(rawReference.selectedReferenceHandle),
+    stringValue(rawReference.referenceHandle),
+    stringValue(rawReference.handle),
+    stringValue(rawReference.label),
+    stringValue(rawReference.name)
+  ];
+
+  const index = positiveIntegerValue(rawReference.index ?? rawReference.position);
+  if (index) {
+    candidates.push(`${index}`);
+    candidates.push(`ref${index}`);
+  }
+
+  return candidates.filter((candidate): candidate is string => Boolean(candidate));
+}
+
+function normalizeReferenceAliasKey(value: string | undefined): string {
+  return value?.trim().replace(/\s+/gu, " ").toLowerCase() ?? "";
+}
+
+function isGenericSelectedReferenceAlias(value: string): boolean {
+  return (
+    value === "ref" ||
+    value === "reference" ||
+    value === "selected" ||
+    value === "selected image" ||
+    value === "selected_image" ||
+    value === "selected canvas image" ||
+    value === "selected_canvas_image" ||
+    value === "canvas reference" ||
+    value === "canvas_reference"
+  );
 }
 
 function parsePlanEdges(input: unknown, issues: GenerationPlanValidationIssue[]): GenerationDependencyEdge[] {
@@ -1271,21 +1752,65 @@ function isOmittedOptionalValue(value: unknown): boolean {
 }
 
 function parseQuality(value: unknown): ImageQuality | undefined {
-  return typeof value === "string" && IMAGE_QUALITIES.includes(value as ImageQuality)
-    ? (value as ImageQuality)
-    : undefined;
+  const normalized = normalizedOptionToken(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  const qualityAliases: Record<string, ImageQuality> = {
+    automatic: "auto",
+    default: "auto",
+    standard: "medium",
+    normal: "medium",
+    balanced: "medium",
+    draft: "low",
+    fast: "low",
+    quick: "low",
+    hd: "high",
+    highquality: "high",
+    best: "high",
+    premium: "high"
+  };
+  const quality = qualityAliases[normalized] ?? normalized;
+  return IMAGE_QUALITIES.includes(quality as ImageQuality) ? (quality as ImageQuality) : undefined;
 }
 
 function parseOutputFormat(value: unknown): OutputFormat | undefined {
-  return typeof value === "string" && OUTPUT_FORMATS.includes(value as OutputFormat)
-    ? (value as OutputFormat)
-    : undefined;
+  const normalized = normalizedOptionToken(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  const outputFormatAliases: Record<string, OutputFormat> = {
+    jpg: "jpeg",
+    imagejpeg: "jpeg",
+    imagejpg: "jpeg",
+    imagepng: "png",
+    imagewebp: "webp"
+  };
+  const outputFormat = outputFormatAliases[normalized] ?? normalized;
+  return OUTPUT_FORMATS.includes(outputFormat as OutputFormat) ? (outputFormat as OutputFormat) : undefined;
 }
 
 function parseGenerationCount(value: unknown): GenerationCount | undefined {
-  return typeof value === "number" && GENERATION_COUNTS.includes(value as GenerationCount)
-    ? (value as GenerationCount)
-    : undefined;
+  const count = positiveIntegerValue(value);
+  return count && GENERATION_COUNTS.includes(count as GenerationCount) ? (count as GenerationCount) : undefined;
+}
+
+function normalizedOptionToken(value: unknown): string | undefined {
+  if (isRecord(value)) {
+    return normalizedOptionToken(value.value ?? value.id ?? value.name ?? value.label);
+  }
+
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/gu, "");
+  return normalized || undefined;
 }
 
 function parseStylePresetId(value: unknown): StylePresetId | undefined {
@@ -1307,9 +1832,31 @@ function parseJobStatus(value: unknown): GenerationJobStatus | undefined {
 }
 
 function parseReferenceKind(value: unknown): GenerationReferenceKind | undefined {
-  return typeof value === "string" && GENERATION_REFERENCE_KINDS.includes(value as GenerationReferenceKind)
-    ? (value as GenerationReferenceKind)
-    : undefined;
+  const normalized = normalizedOptionToken(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  const kindAliases: Record<string, GenerationReferenceKind> = {
+    selectedcanvasimage: "selected_canvas_image",
+    selectedcanvasreference: "selected_canvas_image",
+    selectedimage: "selected_canvas_image",
+    selectedimagereference: "selected_canvas_image",
+    canvasimage: "selected_canvas_image",
+    canvasimagereference: "selected_canvas_image",
+    canvasreference: "selected_canvas_image",
+    referenceimage: "selected_canvas_image",
+    generatedoutput: "generated_output",
+    generatedimage: "generated_output",
+    generatedimagereference: "generated_output",
+    joboutput: "generated_output",
+    sourcejoboutput: "generated_output",
+    sourceoutput: "generated_output",
+    upstreamoutput: "generated_output"
+  };
+
+  const kind = kindAliases[normalized] ?? normalized;
+  return GENERATION_REFERENCE_KINDS.includes(kind as GenerationReferenceKind) ? (kind as GenerationReferenceKind) : undefined;
 }
 
 function parseReferenceUsage(value: unknown): GenerationReferenceUsage | undefined {

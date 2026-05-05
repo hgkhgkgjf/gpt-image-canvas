@@ -226,6 +226,7 @@ export interface ReferenceImageInput {
 export const MAX_REFERENCE_IMAGES = 3;
 export const GENERATION_PLAN_SCHEMA_VERSION = 1 as const;
 export const MAX_GENERATION_PLAN_IMAGES = 16;
+export const MAX_AGENT_SELECTED_REFERENCES = MAX_GENERATION_PLAN_IMAGES;
 export const MAX_GENERATION_JOB_REFERENCES = MAX_REFERENCE_IMAGES;
 
 export type GenerationPlanStatus =
@@ -541,6 +542,16 @@ export interface SaveAgentLlmConfigRequest {
   supportsVision: boolean;
 }
 
+export type AgentThinkingType = "enabled" | "disabled";
+export type AgentReasoningEffort = "high" | "max";
+
+export interface AgentPlannerOptions {
+  thinking?: {
+    type: AgentThinkingType;
+  };
+  reasoningEffort?: AgentReasoningEffort;
+}
+
 export type AgentClientMessageType =
   | "user_message"
   | "revise_plan"
@@ -569,6 +580,7 @@ export interface AgentUserMessageClientMessage extends AgentBaseClientMessage {
   selectedReferences?: AgentSelectedCanvasReference[];
   selectedReferenceIds?: string[];
   defaults?: Record<string, unknown>;
+  plannerOptions?: AgentPlannerOptions;
 }
 
 export interface AgentRevisePlanClientMessage extends AgentBaseClientMessage {
@@ -581,12 +593,14 @@ export interface AgentExecutePlanClientMessage extends AgentBaseClientMessage {
   type: "execute_plan";
   planId: string;
   plan?: GenerationPlan;
+  selectedReferences?: AgentSelectedCanvasReference[];
 }
 
 export interface AgentRetryFailedClientMessage extends AgentBaseClientMessage {
   type: "retry_failed";
   planId: string;
   plan?: GenerationPlan;
+  selectedReferences?: AgentSelectedCanvasReference[];
 }
 
 export type AgentClientMessage =

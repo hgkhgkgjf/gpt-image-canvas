@@ -135,12 +135,43 @@ export async function runReferenceImageGeneration(
 }
 
 async function ensureReferenceAssetIds(input: EditImageProviderInput): Promise<string[]> {
-  if (input.referenceAssetIds?.length === input.referenceImages.length) {
-    return input.referenceAssetIds;
+  return Promise.all(
+    input.referenceImages.map(async (referenceImage, index) => {
+      const existingAssetId = persistedReferenceAssetId(input.referenceAssetIds?.[index]);
+      if (existingAssetId) {
+        return existingAssetId;
+      }
+
+      const savedReferenceAsset = await saveReferenceImageInput(referenceImage);
+      return savedReferenceAsset.id;
+    })
+  );
+}
+
+function persistedReferenceAssetId(assetId: string | undefined): string | undefined {
+  if (!assetId) {
+    return undefined;
   }
 
-  const savedReferenceAssets = await Promise.all(input.referenceImages.map(saveReferenceImageInput));
-  return savedReferenceAssets.map((asset) => asset.id);
+  for (const candidateAssetId of persistedReferenceAssetIdCandidates(assetId)) {
+    const asset = db.select({ id: assets.id }).from(assets).where(eq(assets.id, candidateAssetId)).get();
+    if (asset?.id) {
+      return asset.id;
+    }
+  }
+
+  return undefined;
+}
+
+function persistedReferenceAssetIdCandidates(assetId: string): string[] {
+  const trimmedAssetId = assetId.trim();
+  const candidates = [trimmedAssetId];
+  const tldrawAssetMatch = /^asset:(.+)$/u.exec(trimmedAssetId);
+  if (tldrawAssetMatch?.[1]) {
+    candidates.push(tldrawAssetMatch[1]);
+  }
+
+  return candidates.filter((candidate, index, values) => candidate && values.indexOf(candidate) === index);
 }
 
 async function saveReferenceImageInput(input: ReferenceImageInput): Promise<GeneratedAsset> {

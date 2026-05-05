@@ -41,6 +41,11 @@ async function main(): Promise<void> {
   smokeValidSimplePlan();
   smokeMultiPromptPlan();
   smokeSelectedReferencePlan();
+  smokeSelectedReferenceAliasPlan();
+  smokeSelectedReferenceKindAliases();
+  smokeInferredReferenceKinds();
+  smokeAmbiguousSelectedReferenceFallback();
+  smokeHallucinatedSelectedReferenceWithoutSelection();
   smokeGeneratedAnchorDependencyPlan();
   smokeOverLimitPlanRejection();
   smokeCyclePlanRejection();
@@ -48,11 +53,21 @@ async function main(): Promise<void> {
   smokeNoVisionReferenceHandling();
   smokeDeepSeekPlannerKwargs();
   smokeReasoningExtraction();
+  await smokePlannerQuestionOutput();
+  await smokeMissingSelectedReferenceQuestion();
+  await smokeSelectedEditPlanWithoutReferenceQuestion();
+  await smokeSelectedQuestionOutputFallbackPlan();
+  await smokePerImageSelectedReferencePlan();
+  await smokeBatchSelectedReferenceFallbackUsesAllReferences();
+  await smokeSingleCombinedSelectedReferenceLimitQuestion();
+  await smokeRecentOutputEditWithoutReferencesStillAsks();
+  await smokeCombinedSelectedReferencePlan();
   await smokeDirectPlannerStreamingSuccess();
   await smokeDirectPlannerCancellation();
   await smokeDirectPlannerInvalidJson();
   await smokeDirectPlannerTransportError();
   smokeModelJobSizeCoercion();
+  smokeModelOptionalOutputAliases();
   smokeModelReferenceAliases();
 
   console.log("agent planner smoke checks passed");
@@ -98,6 +113,144 @@ function smokeSelectedReferencePlan(): void {
   );
   expectOk(result, "selected-reference plan");
   expect(result.plan.jobs[0]?.references[0]?.assetId === "asset-ref-1", "selected reference is preserved");
+}
+
+function smokeSelectedReferenceAliasPlan(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          references: [
+            {
+              kind: "selected_canvas_image",
+              usage: "product",
+              assetId: "ref1"
+            }
+          ]
+        })
+      ]
+    }),
+    selectedReferences
+  );
+  expectOk(result, "selected-reference alias plan");
+  expect(result.plan.jobs[0]?.references[0]?.assetId === "asset-ref-1", "ref1 alias is normalized to selected assetId");
+  expect(result.plan.jobs[0]?.references[0]?.label === "Selected product image", "selected reference label is preserved");
+}
+
+function smokeSelectedReferenceKindAliases(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          references: [
+            {
+              kind: "selected canvas image",
+              usage: "product",
+              assetId: "ref1"
+            }
+          ]
+        })
+      ]
+    }),
+    selectedReferences
+  );
+  expectOk(result, "selected-reference kind aliases are accepted");
+  expect(result.plan.jobs[0]?.references[0]?.kind === "selected_canvas_image", "selected reference kind alias is normalized");
+  expect(result.plan.jobs[0]?.references[0]?.assetId === "asset-ref-1", "selected reference alias still resolves assetId");
+}
+
+function smokeInferredReferenceKinds(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          id: "style_anchor",
+          role: "style_anchor",
+          prompt: "Create one visible picture book style anchor.",
+          count: 1
+        }),
+        jobFixture({
+          id: "selected_ref_scene",
+          references: [
+            {
+              usage: "product",
+              assetId: "ref1"
+            }
+          ]
+        }),
+        jobFixture({
+          id: "generated_ref_scene",
+          references: [
+            {
+              usage: "style",
+              sourceJobId: "style_anchor"
+            }
+          ]
+        })
+      ],
+      edges: [
+        {
+          from: "style_anchor",
+          to: "generated_ref_scene"
+        }
+      ]
+    }),
+    selectedReferences
+  );
+
+  expectOk(result, "missing reference kind is inferred from fields");
+  expect(result.plan.jobs[1]?.references[0]?.kind === "selected_canvas_image", "assetId-only reference infers selected_canvas_image");
+  expect(result.plan.jobs[2]?.references[0]?.kind === "generated_output", "sourceJobId-only reference infers generated_output");
+}
+
+function smokeAmbiguousSelectedReferenceFallback(): void {
+  const references: AgentSelectedCanvasReference[] = [
+    ...selectedReferences,
+    {
+      id: "shape-ref-2",
+      assetId: "asset-ref-2",
+      label: "Second canvas image"
+    }
+  ];
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          references: [
+            {
+              kind: "selected_canvas_image",
+              usage: "style",
+              assetId: "ref1 and ref2"
+            }
+          ]
+        })
+      ]
+    }),
+    references
+  );
+  expectOk(result, "ambiguous selected-reference alias falls back instead of rejecting");
+  expect(result.plan.jobs[0]?.references[0]?.assetId === "asset-ref-1", "ambiguous alias falls back to the first selected asset");
+}
+
+function smokeHallucinatedSelectedReferenceWithoutSelection(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          references: [
+            {
+              kind: "selected_canvas_image",
+              usage: "product",
+              assetId: "selected_canvas_image"
+            }
+          ]
+        })
+      ]
+    }),
+    []
+  );
+  expectOk(result, "hallucinated selected reference is ignored when no canvas references are selected");
+  expect(result.plan.jobs[0]?.references.length === 0, "unavailable selected reference is removed");
 }
 
 function smokeGeneratedAnchorDependencyPlan(): void {
@@ -221,8 +374,45 @@ function smokeDeepSeekPlannerKwargs(): void {
     model: "deepseek-v4-pro"
   });
 
-  expect(isRecord(kwargs.thinking), "DeepSeek planner enables thinking");
+  expect(isRecord(kwargs.extra_body), "DeepSeek planner includes extra_body");
+  expect(isRecord(kwargs.extra_body.thinking), "DeepSeek planner enables thinking");
   expect(kwargs.reasoning_effort === "high", "DeepSeek planner sets high reasoning effort");
+
+  const maxKwargs = agentModelKwargsForConfig(
+    {
+      baseUrl: "https://api.deepseek.com",
+      model: "deepseek-v4-pro"
+    },
+    {
+      thinking: { type: "enabled" },
+      reasoningEffort: "max"
+    }
+  );
+  expect(
+    isRecord(maxKwargs.extra_body) &&
+      isRecord(maxKwargs.extra_body.thinking) &&
+      maxKwargs.extra_body.thinking.type === "enabled",
+    "DeepSeek planner keeps thinking enabled"
+  );
+  expect(maxKwargs.reasoning_effort === "max", "DeepSeek planner accepts max reasoning effort");
+
+  const disabledKwargs = agentModelKwargsForConfig(
+    {
+      baseUrl: "https://api.deepseek.com",
+      model: "deepseek-v4-pro"
+    },
+    {
+      thinking: { type: "disabled" },
+      reasoningEffort: "max"
+    }
+  );
+  expect(
+    isRecord(disabledKwargs.extra_body) &&
+      isRecord(disabledKwargs.extra_body.thinking) &&
+      disabledKwargs.extra_body.thinking.type === "disabled",
+    "DeepSeek planner can disable thinking"
+  );
+  expect(!("reasoning_effort" in disabledKwargs), "disabled thinking omits reasoning effort");
 
   const openAIKwargs = agentModelKwargsForConfig({
     model: "gpt-4.1-mini"
@@ -243,6 +433,210 @@ function smokeReasoningExtraction(): void {
   });
 
   expect(reasoning === "I should split the request into four scenes.", "reasoning content is extracted");
+}
+
+async function smokePlannerQuestionOutput(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "在原图上加一行标题。",
+    defaults,
+    selectedReferences: [],
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner({
+      kind: "agent_user_question",
+      code: "missing_selected_canvas_reference",
+      message: "Select the original image first.",
+      createdBy: "agent"
+    })
+  });
+
+  expect(!result.ok, "planner accepts skill question output");
+  expect(result.code === "missing_selected_canvas_reference", "skill question keeps stable missing-reference code");
+}
+
+async function smokeMissingSelectedReferenceQuestion(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "在原图上加一行标题。",
+    defaults,
+    selectedReferences: [],
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner(planFixture())
+  });
+
+  expect(!result.ok, "missing selected reference edit request asks for user input");
+  expect(result.code === "missing_selected_canvas_reference", "missing selected reference uses stable code");
+}
+
+async function smokeSelectedEditPlanWithoutReferenceQuestion(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "给每张图配上文字，更有设计感。",
+    defaults,
+    selectedReferences: selectedReferencesTwo(),
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner(
+      planFixture({
+        jobs: [jobFixture({ id: "blank_template", prompt: "Create a clean geometric template with typography." })]
+      })
+    )
+  });
+
+  expectPlannerOk(result, "selected-image edit plan without references falls back to selected-reference jobs");
+  expect(result.plan.jobs.length === 2, "fallback creates one job per selected image");
+  expect(result.plan.jobs[0]?.references[0]?.assetId === "asset-ref-1", "fallback first job references first selected image");
+  expect(result.plan.jobs[1]?.references[0]?.assetId === "asset-ref-2", "fallback second job references second selected image");
+}
+
+async function smokeSelectedQuestionOutputFallbackPlan(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "给每张图配上文字，更有设计感。",
+    defaults,
+    selectedReferences: selectedReferencesTwo(),
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner({
+      kind: "agent_user_question",
+      code: "agent_requires_user_input",
+      message: "Should I edit selected originals or create new images?",
+      createdBy: "agent"
+    })
+  });
+
+  expectPlannerOk(result, "selected-image edit question output falls back to plan");
+  expect(result.plan.jobs.length === 2, "question fallback creates one job per selected image");
+  expect(result.plan.jobs.every((job) => job.references.length === 1), "question fallback keeps one selected reference per job");
+}
+
+async function smokePerImageSelectedReferencePlan(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "给每张图配上文字，更有设计感。",
+    defaults,
+    selectedReferences: selectedReferencesTwo(),
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner(
+      planFixture({
+        jobs: [
+          jobFixture({
+            id: "caption_ref_1",
+            prompt: "Edit the original selected image directly, preserve the scene, and add refined Chinese title typography.",
+            references: [
+              {
+                kind: "selected_canvas_image",
+                usage: "scene",
+                assetId: "ref1"
+              }
+            ]
+          }),
+          jobFixture({
+            id: "caption_ref_2",
+            prompt: "Edit the original selected image directly, preserve the scene, and add refined Chinese title typography.",
+            references: [
+              {
+                kind: "selected_canvas_image",
+                usage: "scene",
+                assetId: "ref2"
+              }
+            ]
+          })
+        ]
+      })
+    )
+  });
+
+  expectPlannerOk(result, "per-image selected-reference plan");
+  expect(result.plan.jobs.length === 2, "per-image selected edit preserves model-created job split");
+  expect(result.plan.jobs[0]?.references[0]?.assetId === "asset-ref-1", "ref1 is normalized");
+  expect(result.plan.jobs[1]?.references[0]?.assetId === "asset-ref-2", "ref2 is normalized");
+}
+
+async function smokeBatchSelectedReferenceFallbackUsesAllReferences(): Promise<void> {
+  const references = selectedReferencesMany(10);
+  const result = await createGenerationPlan({
+    userText: "让所有图里面的文案字体统一。",
+    defaults,
+    selectedReferences: references,
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner({
+      kind: "agent_user_question",
+      code: "agent_requires_user_input",
+      message: "Should I edit selected originals or create new images?",
+      createdBy: "agent"
+    })
+  });
+
+  expectPlannerOk(result, "batch selected-reference fallback uses all references");
+  expect(result.plan.jobs.length === references.length, "batch fallback creates one job per selected image");
+  expect(result.plan.jobs.every((job) => job.count === 1), "batch fallback keeps each edit job count at one");
+  expect(result.plan.jobs.every((job) => job.references.length === 1), "batch fallback keeps one selected reference per job");
+  expect(result.plan.jobs[9]?.references[0]?.assetId === "asset-ref-10", "batch fallback includes the tenth selected image");
+}
+
+async function smokeSingleCombinedSelectedReferenceLimitQuestion(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "把所有图合成一张海报。",
+    defaults,
+    selectedReferences: selectedReferencesMany(4),
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner(planFixture())
+  });
+
+  expect(!result.ok, "single combined output with more than three references asks for user input");
+  expect(result.code === "agent_requires_user_input", "single combined output limit uses user-input code");
+  expect(result.message.includes("at most 3"), "single combined output limit names the per-job reference cap");
+}
+
+async function smokeRecentOutputEditWithoutReferencesStillAsks(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "让刚刚生成的所有图里面的文案字体统一。",
+    defaults,
+    selectedReferences: [],
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner(planFixture())
+  });
+
+  expect(!result.ok, "recent-output edit without selected references asks for user input");
+  expect(result.code === "missing_selected_canvas_reference", "recent-output edit without frontend fallback keeps missing-reference code");
+}
+
+async function smokeCombinedSelectedReferencePlan(): Promise<void> {
+  const result = await createGenerationPlan({
+    userText: "把两张图组合成一张旅行海报，加上标题。",
+    defaults,
+    selectedReferences: selectedReferencesTwo(),
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner(
+      planFixture({
+        jobs: [
+          jobFixture({
+            id: "combined_poster",
+            prompt: "Combine both selected images into one travel poster and add a refined title.",
+            references: [
+              {
+                kind: "selected_canvas_image",
+                usage: "scene",
+                assetId: "ref1"
+              },
+              {
+                kind: "selected_canvas_image",
+                usage: "scene",
+                assetId: "ref2"
+              }
+            ]
+          })
+        ]
+      })
+    )
+  });
+
+  expectPlannerOk(result, "combined selected-reference plan");
+  expect(result.plan.jobs.length === 1, "combined selected reference plan may keep one job");
+  expect(result.plan.jobs[0]?.references.length === 2, "combined selected reference plan keeps both references");
 }
 
 async function smokeDirectPlannerStreamingSuccess(): Promise<void> {
@@ -301,7 +695,8 @@ async function smokeDirectPlannerStreamingSuccess(): Promise<void> {
   });
 
   expectPlannerOk(result, "streamed direct planner");
-  expect(result.plan.id === "streamed-plan", "streamed planner returns the validated plan");
+  expect(result.plan.id.startsWith("plan-"), "streamed planner assigns a server plan id");
+  expect(result.plan.id !== "streamed-plan", "streamed planner does not reuse the model's temporary plan id");
   expect(result.plan.jobs[0]?.id === "streamed-final", "streamed planner parses final content chunks");
   expect(thinkingDeltas.length === 3, "streamed planner emits reasoning deltas from chunk fields");
   expect(
@@ -423,6 +818,53 @@ function smokeModelJobSizeCoercion(): void {
   expect(nullSizeResult.plan.jobs[0]?.size === undefined, "null job size is omitted from the parsed job");
 }
 
+function smokeModelOptionalOutputAliases(): void {
+  const result = validate(
+    planFixture({
+      defaults: {
+        ...defaults,
+        quality: "standard",
+        outputFormat: "image/png",
+        count: "1"
+      },
+      jobs: [
+        jobFixture({
+          quality: "high_quality",
+          outputFormat: {
+            value: "jpg"
+          },
+          count: "1"
+        })
+      ]
+    }),
+    []
+  );
+
+  expectOk(result, "model optional output aliases are accepted");
+  expect(result.plan.defaults.quality === "medium", "default standard quality maps to medium");
+  expect(result.plan.defaults.outputFormat === "png", "image/png output format maps to png");
+  expect(result.plan.defaults.count === 1, "string default count maps to number");
+  expect(result.plan.jobs[0]?.quality === "high", "job high_quality maps to high");
+  expect(result.plan.jobs[0]?.outputFormat === "jpeg", "job jpg object maps to jpeg");
+  expect(result.plan.jobs[0]?.count === 1, "string job count maps to number");
+
+  const fallbackResult = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          quality: "black",
+          outputFormat: "logo"
+        })
+      ]
+    }),
+    []
+  );
+
+  expectOk(fallbackResult, "unsupported optional output fields fall back instead of rejecting");
+  expect(fallbackResult.plan.jobs[0]?.quality === undefined, "unsupported job quality is omitted");
+  expect(fallbackResult.plan.jobs[0]?.outputFormat === undefined, "unsupported job outputFormat is omitted");
+}
+
 function smokeModelReferenceAliases(): void {
   const result = validate(
     planFixture({
@@ -528,6 +970,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function selectedReferencesTwo(): AgentSelectedCanvasReference[] {
+  return [
+    ...selectedReferences,
+    {
+      id: "shape-ref-2",
+      assetId: "asset-ref-2",
+      label: "Second scenic image",
+      width: 1024,
+      height: 1024,
+      mimeType: "image/png",
+      dataUrl: "data:image/png;base64,BBBB"
+    }
+  ];
+}
+
+function selectedReferencesMany(count: number): AgentSelectedCanvasReference[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `shape-ref-${index + 1}`,
+    assetId: `asset-ref-${index + 1}`,
+    label: `Selected image ${index + 1}`,
+    width: 1024,
+    height: 1024,
+    mimeType: "image/png",
+    dataUrl: `data:image/png;base64,REF${index + 1}`
+  }));
+}
+
 function llmConfigFixture(overrides: Partial<UsableAgentLlmConfig> = {}): UsableAgentLlmConfig {
   return {
     apiKey: "test-key",
@@ -535,6 +1004,20 @@ function llmConfigFixture(overrides: Partial<UsableAgentLlmConfig> = {}): Usable
     timeoutMs: 60000,
     supportsVision: false,
     ...overrides
+  };
+}
+
+function staticPlannerRunner(output: unknown): NonNullable<Parameters<typeof createGenerationPlan>[0]["runner"]> {
+  return {
+    async invoke() {
+      return {
+        messages: [
+          {
+            content: JSON.stringify(output)
+          }
+        ]
+      };
+    }
   };
 }
 

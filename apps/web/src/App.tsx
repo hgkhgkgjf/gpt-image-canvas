@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   Bot,
+  BrainCircuit,
   CheckCircle2,
   ChevronDown,
   CircleStop,
@@ -13,6 +14,7 @@ import {
   Loader2,
   LogOut,
   MapPin,
+  MessageCirclePlus,
   RotateCcw,
   Send,
   Settings,
@@ -50,19 +52,12 @@ import {
   type GenerationPlaceholderShape
 } from "./GenerationPlaceholderShape";
 import {
-  AGENT_PLAN_NODE_ACTION_EVENT,
-  AGENT_PLAN_NODE_HEIGHT,
   AGENT_PLAN_NODE_TYPE,
-  AGENT_PLAN_NODE_WIDTH,
   AgentPlanNodeShapeUtil,
-  createAgentPlanNodeProps,
+  hasFailedPlanJob,
   isAgentPlanNodeShape,
   isGenerationPlan,
-  isUnexecutedPlanStatus,
-  normalizeAgentPlanNodePropsForSnapshot,
-  summarizeGenerationPlanOutputs,
-  type AgentPlanNodeActionDetail,
-  type AgentPlanNodeShape
+  summarizeGenerationPlanOutputs
 } from "./AgentPlanNodeShape";
 import { HomePage } from "./HomePage";
 import { ProviderConfigDialog } from "./ProviderConfigDialog";
@@ -71,6 +66,7 @@ import {
   GENERATION_COUNTS,
   IMAGE_SIZE_MULTIPLE,
   IMAGE_QUALITIES,
+  MAX_AGENT_SELECTED_REFERENCES,
   MAX_IMAGE_ASPECT_RATIO,
   MAX_IMAGE_DIMENSION,
   MAX_REFERENCE_IMAGES,
@@ -83,8 +79,11 @@ import {
   resolutionTierForSize,
   validateImageSize,
   type AgentLlmConfigView,
+  type AgentPlannerOptions,
+  type AgentReasoningEffort,
   type AgentSelectedCanvasReference,
   type AgentServerEvent,
+  type AgentThinkingType,
   type AuthStatusResponse,
   type AssetMetadataResponse,
   type CodexDevicePollResponse,
@@ -92,8 +91,10 @@ import {
   type CodexLogoutResponse,
   type GalleryImageItem,
   type GenerationCount,
+  type GenerationJob,
   type GenerationPlan,
   type GenerationRecord,
+  type GenerationReference,
   type GenerationResponse,
   type GenerationStatus,
   type GeneratedAsset,
@@ -113,6 +114,10 @@ import {
 import { LOCALES, localizedApiErrorMessage, useI18n, type Locale, type Translate } from "./i18n";
 
 const AUTOSAVE_DEBOUNCE_MS = 1200;
+const AGENT_SOCKET_PING_INTERVAL_MS = 15_000;
+const AGENT_SOCKET_RECONNECT_INITIAL_MS = 500;
+const AGENT_SOCKET_RECONNECT_MAX_MS = 10_000;
+const AGENT_SOCKET_RECONNECT_WINDOW_MS = 2 * 60 * 60 * 1000;
 const HISTORY_COLLAPSED_LIMIT = 3;
 const MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024;
 const MOBILE_DRAWER_MEDIA_QUERY = "(max-width: 1023px)";
@@ -149,6 +154,62 @@ function localeForTldrawLocale(locale: TLUserPreferences["locale"]): Locale | un
   }
 
   return undefined;
+}
+
+function isDeepSeekAgentConfigView(config: Pick<AgentLlmConfigView, "baseUrl" | "model"> | null | undefined): boolean {
+  if (!config) {
+    return false;
+  }
+
+  const model = config.model.trim().toLowerCase();
+  const baseUrl = config.baseUrl.trim().toLowerCase();
+  return model.startsWith("deepseek-") || baseUrl.includes("deepseek.");
+}
+
+function agentThinkingSummaryText(locale: Locale): string {
+  return locale === "zh-CN"
+    ? "正在分析任务，整理生图计划与确认节点。"
+    : "Reviewing the request and shaping a generation plan with confirmation steps.";
+}
+
+function agentThinkingChipLabel(locale: Locale, thinkingType: AgentThinkingType, effort: AgentReasoningEffort): string {
+  if (locale === "zh-CN") {
+    return thinkingType === "disabled" ? "思考 Off" : `思考 ${effort === "max" ? "Max" : "High"}`;
+  }
+
+  return thinkingType === "disabled" ? "Thinking Off" : `Thinking ${effort === "max" ? "Max" : "High"}`;
+}
+
+function agentThinkingModeLabel(locale: Locale): string {
+  return locale === "zh-CN" ? "思考模式" : "Thinking mode";
+}
+
+function agentThinkingEffortLabel(locale: Locale): string {
+  return locale === "zh-CN" ? "思考强度" : "Reasoning effort";
+}
+
+function agentThinkingEnabledLabel(locale: Locale): string {
+  return locale === "zh-CN" ? "开启" : "On";
+}
+
+function agentThinkingDisabledLabel(locale: Locale): string {
+  return locale === "zh-CN" ? "关闭" : "Off";
+}
+
+function agentThinkingRawToggleLabel(locale: Locale, expanded: boolean): string {
+  if (locale === "zh-CN") {
+    return expanded ? "收起原始思考" : "查看原始思考";
+  }
+
+  return expanded ? "Hide raw reasoning" : "Show raw reasoning";
+}
+
+function agentPreviewDisclosureLabel(locale: Locale, count: number): string {
+  if (locale === "zh-CN") {
+    return `${count} 张缩略图`;
+  }
+
+  return `${count} ${count === 1 ? "thumbnail" : "thumbnails"}`;
 }
 
 const defaultStorageConfigForm: StorageConfigFormState = {
@@ -216,7 +277,30 @@ type PanelTab = "manual" | "agent";
 type PanelStatusTone = "progress" | "success" | "warning" | "error";
 type CodexLoginStatus = "idle" | "starting" | "pending" | "authorized" | "expired" | "denied" | "error";
 type AgentRunStatus = "idle" | "connecting" | "running";
-type AgentChatMessageRole = "user" | "assistant" | "thinking" | "system" | "error" | "plan";
+type AgentChatMessageRole = "user" | "assistant" | "thinking" | "system" | "error" | "question" | "plan";
+type AgentPlanAction = "execute" | "cancel" | "retry_failed";
+
+function isCopyableAgentMessageRole(role: AgentChatMessageRole): boolean {
+  return role === "user" || role === "assistant" || role === "thinking";
+}
+
+function isAgentUserInputErrorCode(code: string | undefined): boolean {
+  return code === "missing_selected_canvas_reference" || code === "agent_requires_user_input";
+}
+
+function shouldUseRecentAgentOutputsForAgentEdit(userText: string): boolean {
+  const text = userText.trim().toLowerCase().replace(/\s+/gu, " ");
+  if (!text) {
+    return false;
+  }
+
+  const hasImageContext =
+    /(?:\u56fe|\u56fe\u7247|\u753b\u9762|\u521a\u521a|\u4e0a\u4e00\u8f6e|\u751f\u6210\u7684|\u6240\u6709|\u5168\u90e8|\u6bcf\u5f20|\u6bcf\u4e00\u5f20|image|images|picture|pictures|previous|latest|generated|all|each|every)/u.test(text);
+  const hasEditAction =
+    /(?:\u7f16\u8f91|\u4fee\u6539|\u8c03\u6574|\u6539\u6210|\u6539\u4e3a|\u4f18\u5316|\u6da6\u8272|\u91cd\u7ed8|\u4fee\u56fe|\u4fdd\u7559|\u57fa\u4e8e|\u57fa\u7840\u4e0a|\u52a0\u5b57|\u52a0\u4e0a\u5b57|\u52a0\u6587\u5b57|\u914d\u5b57|\u914d\u6587|\u6587\u6848|\u6807\u9898|\u5b57\u5e55|\u5b57\u4f53|\u6392\u7248|\u8d34\u5b57|\u4e00\u81f4|\u7edf\u4e00|edit|modify|retouch|polish|redesign|based on|from the original|add text|text overlay|caption|title|typography|copy|font|consistent|unify)/u.test(text);
+
+  return hasImageContext && hasEditAction;
+}
 
 interface PanelStatus {
   tone: PanelStatusTone;
@@ -234,10 +318,21 @@ interface AgentChatAssetPreview {
   url: string;
 }
 
+interface RecentAgentOutputReference {
+  assetId: string;
+  jobId: string;
+  outputId?: string;
+  planId?: string;
+  shapeId?: TLShapeId;
+  url: string;
+  asset: GeneratedAsset;
+}
+
 interface AgentChatMessage {
   id: string;
   role: AgentChatMessageRole;
   content: string;
+  details?: string;
   timestamp: string;
   runId?: string;
   plan?: unknown;
@@ -272,9 +367,24 @@ interface GenerationPlaceholderPlacement {
   targetHeight: number;
 }
 
+interface AgentOutputPlacementLayout {
+  columns: number;
+  rows: number;
+  cellWidth: number;
+  cellHeight: number;
+}
+
 interface ActiveGenerationPlaceholders {
   requestId: number;
   placements: GenerationPlaceholderPlacement[];
+}
+
+interface AgentJobPlaceholderSet {
+  planId: string;
+  jobId: string;
+  runId?: string;
+  placeholderSet: ActiveGenerationPlaceholders;
+  outputSlots: Map<string, number>;
 }
 
 interface ActiveGenerationTask {
@@ -487,23 +597,6 @@ function isAgentPlanNodeSnapshotRecord(value: unknown): value is Record<string, 
   return isRecord(value) && value.typeName === "shape" && value.type === AGENT_PLAN_NODE_TYPE;
 }
 
-function normalizeAgentPlanNodeSnapshotRecord(record: Record<string, unknown>): Record<string, unknown> {
-  const nextProps = normalizeAgentPlanNodePropsForSnapshot(record.props);
-  const nextRecord: Record<string, unknown> = {
-    ...record,
-    props: nextProps
-  };
-
-  if (typeof nextRecord.x !== "number" || !Number.isFinite(nextRecord.x)) {
-    nextRecord.x = 0;
-  }
-  if (typeof nextRecord.y !== "number" || !Number.isFinite(nextRecord.y)) {
-    nextRecord.y = 0;
-  }
-
-  return nextRecord;
-}
-
 function filterLoadingPlaceholdersFromStoreSnapshot<TSnapshot>(snapshot: TSnapshot): TSnapshot {
   if (!isRecord(snapshot) || !isRecord(snapshot.store)) {
     return snapshot;
@@ -518,9 +611,7 @@ function filterLoadingPlaceholdersFromStoreSnapshot<TSnapshot>(snapshot: TSnapsh
     }
 
     if (isAgentPlanNodeSnapshotRecord(record)) {
-      const nextRecord = normalizeAgentPlanNodeSnapshotRecord(record);
-      nextStore[id] = nextRecord;
-      changed ||= nextRecord !== record;
+      changed = true;
       continue;
     }
 
@@ -711,13 +802,12 @@ function createCenteredPlacements(editor: Editor, countValue: GenerationCount, s
   });
 }
 
-function createGenerationPlaceholders(
+function createGenerationPlaceholdersFromPlacements(
   editor: Editor,
-  input: GenerationSubmitInput,
+  placements: GenerationPlaceholderPlacement[],
   requestId: number,
   options: { selectPlaceholders?: boolean } = {}
 ): ActiveGenerationPlaceholders {
-  const placements = createCenteredPlacements(editor, input.count, input.size);
   const placeholderIds = placements.map((placement) => placement.id);
 
   editor.createShapes<GenerationPlaceholderShape>(
@@ -749,206 +839,85 @@ function createGenerationPlaceholders(
   };
 }
 
-function selectedShapesPageBounds(editor: Editor): { x: number; y: number; w: number; h: number } | undefined {
-  const bounds = editor.getSelectedShapes().flatMap((shape) => {
-    const pageBounds = editor.getShapePageBounds(shape);
-    return pageBounds ? [pageBounds] : [];
-  });
-
-  if (bounds.length === 0) {
-    return undefined;
-  }
-
-  const minX = Math.min(...bounds.map((box) => box.x));
-  const minY = Math.min(...bounds.map((box) => box.y));
-  const maxX = Math.max(...bounds.map((box) => box.x + box.w));
-  const maxY = Math.max(...bounds.map((box) => box.y + box.h));
-
-  return {
-    x: minX,
-    y: minY,
-    w: maxX - minX,
-    h: maxY - minY
-  };
-}
-
-function agentPlanNodePlacement(editor: Editor, nearShape?: AgentPlanNodeShape): { x: number; y: number } {
-  const gap = 56;
-  if (nearShape) {
-    const bounds = editor.getShapePageBounds(nearShape);
-    if (bounds) {
-      return {
-        x: bounds.x + bounds.w + gap,
-        y: bounds.y
-      };
-    }
-  }
-
-  const selectedBounds = selectedShapesPageBounds(editor);
-  if (selectedBounds) {
-    return {
-      x: selectedBounds.x + selectedBounds.w + gap,
-      y: selectedBounds.y
-    };
-  }
-
-  const viewport = editor.getViewportPageBounds();
-  return {
-    x: viewport.center.x - AGENT_PLAN_NODE_WIDTH / 2,
-    y: viewport.center.y - AGENT_PLAN_NODE_HEIGHT / 2
-  };
-}
-
-function findAgentPlanNodes(editor: Editor, planId: string): AgentPlanNodeShape[] {
-  return editor.getCurrentPageShapes().flatMap((shape) => {
-    if (!isAgentPlanNodeShape(shape)) {
-      return [];
-    }
-
-    const props = normalizeAgentPlanNodePropsForSnapshot(shape.props);
-    return isGenerationPlan(props.plan) && props.plan.id === planId ? [shape] : [];
-  });
-}
-
-function createAgentPlanNode(editor: Editor, plan: GenerationPlan, lastRunId = "", nearShape?: AgentPlanNodeShape): AgentPlanNodeShape {
-  const placement = agentPlanNodePlacement(editor, nearShape);
-  const id = createTldrawShapeId();
-  editor.createShapes<AgentPlanNodeShape>([
-    {
-      id,
-      type: AGENT_PLAN_NODE_TYPE,
-      x: placement.x,
-      y: placement.y,
-      props: createAgentPlanNodeProps(plan, lastRunId)
-    }
-  ]);
-  editor.bringToFront([id]);
-  editor.select(id);
-  return editor.getShape(id) as AgentPlanNodeShape;
-}
-
-function updateAgentPlanNode(editor: Editor, shape: AgentPlanNodeShape, plan: GenerationPlan, lastRunId = ""): void {
-  const props = normalizeAgentPlanNodePropsForSnapshot(shape.props);
-  const selectedJobId = plan.jobs.some((job) => job.id === props.selectedJobId) ? props.selectedJobId : plan.jobs[0]?.id ?? "";
-
-  editor.updateShapes<AgentPlanNodeShape>([
-    {
-      id: shape.id,
-      type: AGENT_PLAN_NODE_TYPE,
-      props: {
-        plan,
-        w: props.w,
-        h: props.h,
-        selectedJobId,
-        lastRunId: lastRunId || props.lastRunId
-      }
-    }
-  ]);
-  editor.bringToFront([shape.id]);
-  editor.select(shape.id);
-}
-
-function upsertAgentPlanNode(input: {
-  editor: Editor;
-  eventType: "plan_created" | "plan_updated";
-  lastRunId?: string;
-  plan: GenerationPlan;
-}): TLShapeId | undefined {
-  if (input.eventType === "plan_created") {
-    return createAgentPlanNode(input.editor, input.plan, input.lastRunId).id;
-  }
-
-  const existingNodes = findAgentPlanNodes(input.editor, input.plan.id);
-  const unexecutedNode = [...existingNodes].reverse().find((shape) => {
-    const props = normalizeAgentPlanNodePropsForSnapshot(shape.props);
-    return isGenerationPlan(props.plan) && isUnexecutedPlanStatus(props.plan.status);
-  });
-
-  if (unexecutedNode) {
-    updateAgentPlanNode(input.editor, unexecutedNode, input.plan, input.lastRunId);
-    return unexecutedNode.id;
-  }
-
-  const latestNode = existingNodes.at(-1);
-  return createAgentPlanNode(input.editor, input.plan, input.lastRunId, latestNode).id;
-}
-
-function latestAgentPlanNode(editor: Editor, planId: string): AgentPlanNodeShape | undefined {
-  return findAgentPlanNodes(editor, planId).at(-1);
-}
-
-type AgentPlanNodeLookupResult =
-  | {
-      status: "found";
-      shape: AgentPlanNodeShape;
-    }
-  | {
-      status: "malformed" | "missing";
-    };
-
-function findLatestAgentPlanNodeForActivation(editor: Editor, planId: string): AgentPlanNodeLookupResult {
-  let latestMatch: AgentPlanNodeShape | undefined;
-  let hasMalformedMatch = false;
-
-  for (const shape of editor.getCurrentPageShapes()) {
-    if (!isAgentPlanNodeShape(shape)) {
-      continue;
-    }
-
-    const props = normalizeAgentPlanNodePropsForSnapshot(shape.props);
-    if (isGenerationPlan(props.plan)) {
-      if (props.plan.id === planId) {
-        latestMatch = shape;
-      }
-      continue;
-    }
-
-    if (isRecord(props.plan) && props.plan.id === planId) {
-      hasMalformedMatch = true;
-    }
-  }
-
-  if (latestMatch) {
-    return {
-      status: "found",
-      shape: latestMatch
-    };
-  }
-
-  return {
-    status: hasMalformedMatch ? "malformed" : "missing"
-  };
-}
-
-function agentOutputPlacement(
+function createGenerationPlaceholders(
   editor: Editor,
-  planId: string | undefined,
-  asset: GeneratedAsset,
-  index: number
+  input: GenerationSubmitInput,
+  requestId: number,
+  options: { selectPlaceholders?: boolean } = {}
+): ActiveGenerationPlaceholders {
+  return createGenerationPlaceholdersFromPlacements(editor, createCenteredPlacements(editor, input.count, input.size), requestId, options);
+}
+
+function deleteAgentPlanNodes(editor: Editor): number {
+  const planNodeIds = editor.getCurrentPageShapes().flatMap((shape) => (isAgentPlanNodeShape(shape) ? [shape.id] : []));
+  if (planNodeIds.length > 0) {
+    editor.deleteShapes(planNodeIds);
+  }
+
+  return planNodeIds.length;
+}
+
+function agentPlanOutputLayout(plan: GenerationPlan): AgentOutputPlacementLayout {
+  const totalCount = Math.max(1, plan.jobs.reduce((total, job) => total + Math.max(0, job.count), 0));
+  const columns = totalCount >= 8 ? 4 : totalCount === 1 ? 1 : 2;
+  const rows = Math.ceil(totalCount / columns);
+  const displaySizes = plan.jobs.map((job) => displaySize(job.size ?? plan.defaults.size));
+  const cellWidth = Math.max(...displaySizes.map((size) => size.width), 1);
+  const cellHeight = Math.max(...displaySizes.map((size) => size.height), 1);
+
+  return {
+    columns,
+    rows,
+    cellWidth,
+    cellHeight
+  };
+}
+
+function agentOutputPlacementForSize(
+  editor: Editor,
+  targetSize: ImageSize,
+  index: number,
+  layout?: AgentOutputPlacementLayout
 ): GenerationPlaceholderPlacement {
-  const size = displaySize({
-    width: asset.width,
-    height: asset.height
-  });
+  const size = displaySize(targetSize);
   const gap = 28;
-  const columns = 2;
-  const planNode = planId ? latestAgentPlanNode(editor, planId) : undefined;
-  const bounds = planNode ? editor.getShapePageBounds(planNode) : undefined;
+  const columns = layout?.columns ?? 2;
+  const cellWidth = layout?.cellWidth ?? size.width;
+  const cellHeight = layout?.cellHeight ?? size.height;
+  const rows = layout?.rows ?? Math.max(1, Math.ceil((index + 1) / columns));
   const viewport = editor.getViewportPageBounds();
-  const baseX = bounds ? bounds.x + bounds.w + 56 : viewport.center.x + 72;
-  const baseY = bounds ? bounds.y : viewport.center.y - size.height / 2;
+  const gridWidth = columns * cellWidth + (columns - 1) * gap;
+  const gridHeight = rows * cellHeight + (rows - 1) * gap;
+  const baseX = viewport.center.x - gridWidth / 2;
+  const baseY = viewport.center.y - gridHeight / 2;
   const column = index % columns;
   const row = Math.floor(index / columns);
 
   return {
     id: createTldrawShapeId(),
-    x: baseX + column * (size.width + gap),
-    y: baseY + row * (size.height + gap),
+    x: baseX + column * (cellWidth + gap) + (cellWidth - size.width) / 2,
+    y: baseY + row * (cellHeight + gap) + (cellHeight - size.height) / 2,
     width: size.width,
     height: size.height,
-    targetWidth: asset.width,
-    targetHeight: asset.height
+    targetWidth: targetSize.width,
+    targetHeight: targetSize.height
   };
+}
+
+function agentOutputPlacement(
+  editor: Editor,
+  _planId: string | undefined,
+  asset: GeneratedAsset,
+  index: number
+): GenerationPlaceholderPlacement {
+  return agentOutputPlacementForSize(
+    editor,
+    {
+      width: asset.width,
+      height: asset.height
+    },
+    index
+  );
 }
 
 function isGenerationPlaceholderShape(shape: unknown): shape is GenerationPlaceholderShape {
@@ -1161,6 +1130,13 @@ function deleteLoadingGenerationPlaceholders(editor: Editor, placeholderSet: Act
   }
 }
 
+function hasLoadingGenerationPlaceholders(editor: Editor, placeholderSet: ActiveGenerationPlaceholders): boolean {
+  return placeholderSet.placements.some((placement) => {
+    const shape = editor.getShape(placement.id);
+    return isGenerationPlaceholderShape(shape) && shape.props.status === "loading";
+  });
+}
+
 function firstLiveGenerationPlaceholder(editor: Editor, placeholderSet: ActiveGenerationPlaceholders): TLShapeId | undefined {
   return placeholderSet.placements.find((placement) => isGenerationPlaceholderShape(editor.getShape(placement.id)))?.id;
 }
@@ -1255,8 +1231,8 @@ function resolveAgentReferenceSelection(editor: Editor, t: Translate): AgentRefe
   }
 
   const warnings: string[] = [];
-  if (selectedImages.length > MAX_REFERENCE_IMAGES) {
-    warnings.push(t("agentReferenceTooMany", { count: selectedImages.length, max: MAX_REFERENCE_IMAGES }));
+  if (selectedImages.length > MAX_AGENT_SELECTED_REFERENCES) {
+    warnings.push(t("agentReferenceTooMany", { count: selectedImages.length, max: MAX_AGENT_SELECTED_REFERENCES }));
   }
   const nonImageCount = selectedShapes.length - selectedImages.length;
   if (nonImageCount > 0) {
@@ -1265,7 +1241,7 @@ function resolveAgentReferenceSelection(editor: Editor, t: Translate): AgentRefe
 
   const references: ReferenceSelectionItem[] = [];
   let unreadableCount = 0;
-  for (const { imageShape } of selectedImages.slice(0, MAX_REFERENCE_IMAGES)) {
+  for (const { imageShape } of selectedImages.slice(0, MAX_AGENT_SELECTED_REFERENCES)) {
     const asset = imageShape.props.assetId ? editor.getAsset(imageShape.props.assetId) : undefined;
     const sourceUrl = getImageSourceUrl(imageShape, asset);
     if (!sourceUrl || !isReadableReferenceSource(sourceUrl, asset)) {
@@ -1293,7 +1269,7 @@ function resolveAgentReferenceSelection(editor: Editor, t: Translate): AgentRefe
     totalSelectedCount: selectedShapes.length,
     hint:
       references.length > 0
-        ? t("agentReferenceReady", { count: references.length, max: MAX_REFERENCE_IMAGES })
+        ? t("agentReferenceReady", { count: references.length, max: MAX_AGENT_SELECTED_REFERENCES })
         : t("agentReferenceEmpty"),
     warning: warnings.join(t("commonListSeparator")) || undefined
   };
@@ -1405,7 +1381,7 @@ function getLocalAssetId(asset: TLAsset | undefined, sourceUrl?: string): string
   try {
     const url = new URL(sourceUrl, window.location.origin);
     if (url.origin === window.location.origin) {
-      const match = /^\/api\/assets\/([^/?#]+)(?:\/download)?$/u.exec(url.pathname);
+      const match = /^\/api\/assets\/([^/?#]+)(?:\/(?:download|preview))?$/u.exec(url.pathname);
       return match?.[1];
     }
   } catch {
@@ -1820,9 +1796,15 @@ async function readStoredReferenceImage(assetId: string, signal: AbortSignal, t:
   };
 }
 
-function agentWebSocketUrl(): string {
+function agentWebSocketUrl(connectionId?: string | null, runId?: string | null): string {
   const url = new URL("/api/agent/ws", window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  if (connectionId) {
+    url.searchParams.set("connectionId", connectionId);
+  }
+  if (runId) {
+    url.searchParams.set("runId", runId);
+  }
   return url.toString();
 }
 
@@ -1841,32 +1823,36 @@ function agentReferenceLabel(reference: ReferenceSelectionItem, index: number, t
 
 async function buildAgentSelectedReferences(input: {
   references: ReferenceSelectionItem[];
-  supportsVision: boolean;
   t: Translate;
 }): Promise<AgentSelectedCanvasReference[]> {
   const controller = new AbortController();
   return Promise.all(
-    input.references.slice(0, MAX_REFERENCE_IMAGES).map(async (reference, index) => {
+    input.references.slice(0, MAX_AGENT_SELECTED_REFERENCES).map(async (reference, index) => {
+      const readableReference = await readReferenceImage(reference, controller.signal, input.t);
       const selectedReference: AgentSelectedCanvasReference = {
         id: `selected-${index + 1}`,
         assetId: agentReferenceAssetId(reference, index),
         label: agentReferenceLabel(reference, index, input.t),
         width: Math.round(reference.width),
-        height: Math.round(reference.height)
-      };
-
-      if (!input.supportsVision) {
-        return selectedReference;
-      }
-
-      const readableReference = await readReferenceImage(reference, controller.signal, input.t);
-      return {
-        ...selectedReference,
+        height: Math.round(reference.height),
         mimeType: readableReference.mimeType,
         dataUrl: readableReference.dataUrl
       };
+
+      return selectedReference;
     })
   );
+}
+
+function buildRecentAgentOutputSelectedReferences(outputs: RecentAgentOutputReference[]): AgentSelectedCanvasReference[] {
+  return outputs.slice(0, MAX_AGENT_SELECTED_REFERENCES).map((output, index) => ({
+    id: `recent-agent-output-${index + 1}`,
+    assetId: output.assetId,
+    label: output.asset.fileName || `Agent output ${index + 1}`,
+    width: output.asset.width,
+    height: output.asset.height,
+    mimeType: output.asset.mimeType
+  }));
 }
 
 function parseAgentServerEvent(data: MessageEvent["data"]): AgentServerEvent | undefined {
@@ -1886,12 +1872,93 @@ function optionalShapeIdFromEvent(event: AgentServerEvent): TLShapeId | undefine
   return isRecord(event) && typeof event.shapeId === "string" ? (event.shapeId as TLShapeId) : undefined;
 }
 
+function planJobDependencies(plan: GenerationPlan, job: GenerationJob): string[] {
+  return plan.edges.filter((edge) => edge.toJobId === job.id).map((edge) => edge.fromJobId);
+}
+
+function planReferenceLabel(reference: GenerationReference, t: Translate): string {
+  const usage = t("agentPlanReferenceUsageLabel", { usage: reference.usage });
+  if (reference.kind === "generated_output") {
+    return `${usage}: ${t("agentPlanReferenceGenerated", { jobId: reference.jobId ?? "?" })}`;
+  }
+
+  return `${usage}: ${t("agentPlanReferenceSelected", { label: reference.label ?? reference.assetId ?? "?" })}`;
+}
+
+function planReferenceCount(plan: GenerationPlan): number {
+  return plan.jobs.reduce((count, job) => count + job.references.length, 0);
+}
+
+function AgentPlanReviewNodes({ plan, t }: { plan: GenerationPlan; t: Translate }) {
+  const summary = summarizeGenerationPlanOutputs(plan);
+  const nodes = [
+    t("agentPlanReviewScope", { total: summary.totalImageCount, jobs: summary.jobCount }),
+    t("agentPlanReviewReferences", { count: planReferenceCount(plan) }),
+    t("agentPlanReviewDependencies", { count: plan.edges.length }),
+    t("agentPlanReviewConfirm")
+  ];
+
+  return (
+    <section className="agent-plan-card__review" aria-label={t("agentPlanReviewTitle")}>
+      <span className="agent-plan-card__section-title">{t("agentPlanReviewTitle")}</span>
+      <div className="agent-plan-card__review-nodes">
+        {nodes.map((node, index) => (
+          <span className="agent-plan-card__review-node" data-step={index + 1} key={`${index}-${node}`}>
+            {node}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AgentPlanJobDetails({ plan, t }: { plan: GenerationPlan; t: Translate }) {
+  return (
+    <section className="agent-plan-card__details" aria-label={t("agentPlanDetailsTitle")}>
+      <span className="agent-plan-card__section-title">{t("agentPlanDetailsTitle")}</span>
+      <div className="agent-plan-card__job-list">
+        {plan.jobs.map((job) => {
+          const dependencies = planJobDependencies(plan, job);
+          const references = job.references.map((reference) => planReferenceLabel(reference, t));
+          return (
+            <article className="agent-plan-card__job" data-status={job.status} key={job.id}>
+              <span className="agent-plan-card__job-title">
+                {t("agentPlanJobLine", {
+                  id: job.id,
+                  role: t("agentPlanRoleLabel", { role: job.role }),
+                  count: job.count,
+                  status: t("agentPlanJobStatusLabel", { status: job.status })
+                })}
+              </span>
+              <p>
+                <strong>{t("agentPlanJobPrompt")}</strong>
+                {job.prompt}
+              </p>
+              {dependencies.length > 0 ? <span>{t("agentPlanJobDependsOn", { ids: dependencies.join(", ") })}</span> : null}
+              <span>
+                {references.length > 0
+                  ? t("agentPlanJobReferences", { references: references.join(", ") })
+                  : t("agentPlanJobNoReferences")}
+              </span>
+              {job.error ? <span>{job.error}</span> : null}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function AgentPlanCard({
-  onLocate,
+  isAgentConfigured,
+  isAgentRunning,
+  onAction,
   plan,
   t
 }: {
-  onLocate: (plan: unknown) => void;
+  isAgentConfigured: boolean;
+  isAgentRunning: boolean;
+  onAction: (plan: GenerationPlan, action: AgentPlanAction) => void;
   plan: unknown;
   t: Translate;
 }) {
@@ -1905,27 +1972,66 @@ function AgentPlanCard({
   }
 
   const summary = summarizeGenerationPlanOutputs(plan);
+  const canExecute = (plan.status === "awaiting_confirmation" || plan.status === "confirmed") && isAgentConfigured && !isAgentRunning;
+  const showConfirmationHint = plan.status === "awaiting_confirmation" || plan.status === "confirmed";
+  const showRetry = hasFailedPlanJob(plan);
+  const canRetry = showRetry && isAgentConfigured && !isAgentRunning;
+  const showCancel = plan.status === "running";
+  const canCancel = showCancel && isAgentRunning;
 
   return (
-    <button
-      aria-label={t("agentPlanLocate", { title: plan.title })}
+    <article
       className="agent-plan-card"
       data-testid="agent-plan-card"
-      type="button"
-      onClick={() => onLocate(plan)}
     >
       <span className="agent-plan-card__heading">
         <strong>{plan.title}</strong>
-        <MapPin className="size-3.5" aria-hidden="true" />
+        <span className="agent-plan-card__status">{t("agentPlanStatus", { status: plan.status })}</span>
       </span>
-      <span>
+      <span className="agent-plan-card__summary">
         {t("agentPlanSummary", {
           finalOutputs: summary.finalImageCount,
           jobs: summary.jobCount,
           supportOutputs: summary.supportImageCount
         })}
       </span>
-    </button>
+      {showConfirmationHint ? <span className="agent-plan-card__hint">{t("agentPlanConfirmationHint")}</span> : null}
+      <AgentPlanReviewNodes plan={plan} t={t} />
+      <AgentPlanJobDetails plan={plan} t={t} />
+      <div className="agent-plan-card__actions">
+        <button
+          className="agent-plan-card__action agent-plan-card__action--primary"
+          disabled={!canExecute}
+          type="button"
+          onClick={() => onAction(plan, "execute")}
+        >
+          <CheckCircle2 className="size-3.5" aria-hidden="true" />
+          {t("agentPlanExecute")}
+        </button>
+        {showRetry ? (
+          <button
+            className="agent-plan-card__action"
+            disabled={!canRetry}
+            type="button"
+            onClick={() => onAction(plan, "retry_failed")}
+          >
+            <RotateCcw className="size-3.5" aria-hidden="true" />
+            {t("agentPlanRetryFailed")}
+          </button>
+        ) : null}
+        {showCancel ? (
+          <button
+            className="agent-plan-card__action"
+            disabled={!canCancel}
+            type="button"
+            onClick={() => onAction(plan, "cancel")}
+          >
+            <CircleStop className="size-3.5" aria-hidden="true" />
+            {t("agentPlanCancel")}
+          </button>
+        ) : null}
+      </div>
+    </article>
   );
 }
 
@@ -2377,8 +2483,12 @@ export function App() {
   const [isAgentConfigLoading, setIsAgentConfigLoading] = useState(true);
   const [agentConfigError, setAgentConfigError] = useState("");
   const [agentMessages, setAgentMessages] = useState<AgentChatMessage[]>([]);
+  const [copiedAgentMessageId, setCopiedAgentMessageId] = useState<string | null>(null);
+  const [expandedThinkingMessageIds, setExpandedThinkingMessageIds] = useState<string[]>([]);
   const [agentRunStatus, setAgentRunStatus] = useState<AgentRunStatus>("idle");
   const [agentReferenceSelection, setAgentReferenceSelection] = useState<AgentReferenceSelection>(() => emptyAgentReferenceSelection(t));
+  const [agentThinkingType, setAgentThinkingType] = useState<AgentThinkingType>("enabled");
+  const [agentReasoningEffort, setAgentReasoningEffort] = useState<AgentReasoningEffort>("high");
   const [isAgentSettingsOpen, setIsAgentSettingsOpen] = useState(false);
   const [isCanvasDarkMode, setIsCanvasDarkMode] = useState(false);
   const canvasShellRef = useRef<HTMLElement | null>(null);
@@ -2390,9 +2500,23 @@ export function App() {
   const agentRequestRef = useRef(0);
   const agentSocketRef = useRef<WebSocket | null>(null);
   const agentSocketOpenPromiseRef = useRef<Promise<WebSocket> | null>(null);
+  const agentSocketPingTimerRef = useRef<number | undefined>();
+  const agentSocketReconnectTimerRef = useRef<number | undefined>();
+  const agentSocketReconnectDeadlineRef = useRef<number | undefined>();
+  const agentSocketReconnectDelayRef = useRef(AGENT_SOCKET_RECONNECT_INITIAL_MS);
+  const agentConnectionIdRef = useRef<string | null>(null);
   const activeAgentRunIdRef = useRef<string | null>(null);
   const agentTranscriptRef = useRef<HTMLElement | null>(null);
   const agentOutputPlacementCountsRef = useRef<Map<string, number>>(new Map());
+  const agentJobPlaceholdersRef = useRef<Map<string, AgentJobPlaceholderSet>>(new Map());
+  const pendingAgentSelectedReferencesRef = useRef<Map<string, AgentSelectedCanvasReference[]>>(new Map());
+  const agentPlanSelectedReferencesRef = useRef<Map<string, AgentSelectedCanvasReference[]>>(new Map());
+  const pendingAgentOutputReferencesRef = useRef<Map<string, RecentAgentOutputReference[]>>(new Map());
+  const recentSuccessfulAgentOutputReferencesRef = useRef<RecentAgentOutputReference[]>([]);
+  const agentPlaceholderRequestRef = useRef(0);
+  const agentCopyResetTimerRef = useRef<number | undefined>();
+  const agentPlanCreatedRunIdsRef = useRef<Set<string>>(new Set());
+  const agentUserInputRunIdsRef = useRef<Set<string>>(new Set());
   const saveTimerRef = useRef<number | undefined>();
   const codexPollTimerRef = useRef<number | undefined>();
   const saveRequestRef = useRef(0);
@@ -2401,9 +2525,19 @@ export function App() {
   const isAgentRunning = agentRunStatus === "connecting" || agentRunStatus === "running";
   const trimmedAgentInput = agentInput.trim();
   const isAgentConfigured = Boolean(agentConfig?.configured);
+  const supportsAgentThinkingControls = isDeepSeekAgentConfigView(agentConfig);
   const agentDefaultsValidationMessage = sizeValidationMessage(agentWidth, agentHeight, t, locale);
   const canSendAgentMessage = Boolean(
     trimmedAgentInput && isAgentConfigured && !isAgentConfigLoading && !isAgentRunning && !agentDefaultsValidationMessage
+  );
+  const agentPlannerOptions = useMemo<AgentPlannerOptions>(
+    () => ({
+      thinking: {
+        type: agentThinkingType
+      },
+      reasoningEffort: agentThinkingType === "enabled" ? agentReasoningEffort : undefined
+    }),
+    [agentReasoningEffort, agentThinkingType]
   );
   const agentDefaults = useMemo(
     () => ({
@@ -2420,12 +2554,13 @@ export function App() {
   const agentCompactSizeSummary = `${agentWidth}x${agentHeight}`;
   const agentQualitySummary = t("qualityLabel", { quality: agentQuality });
   const agentFormatSummary = t("outputFormatLabel", { format: agentOutputFormat });
+  const agentThinkingSummary = agentThinkingChipLabel(locale, agentThinkingType, agentReasoningEffort);
   const agentReferenceCount = agentReferenceSelection.references.length;
   const agentReferenceSummary = t("agentParamReferences", {
     count: agentReferenceCount,
-    max: MAX_REFERENCE_IMAGES
+    max: MAX_AGENT_SELECTED_REFERENCES
   });
-  const agentReferenceCompactSummary = `${agentReferenceCount}/${MAX_REFERENCE_IMAGES}`;
+  const agentReferenceCompactSummary = `${agentReferenceCount}/${MAX_AGENT_SELECTED_REFERENCES}`;
 
   const trimmedPrompt = prompt.trim();
   const promptValidationMessage = prompt.trim() ? "" : t("promptRequired");
@@ -2599,7 +2734,17 @@ export function App() {
       agentSocketRef.current?.close();
       agentSocketRef.current = null;
       agentSocketOpenPromiseRef.current = null;
+      window.clearInterval(agentSocketPingTimerRef.current);
+      agentSocketPingTimerRef.current = undefined;
+      window.clearTimeout(agentSocketReconnectTimerRef.current);
+      agentSocketReconnectTimerRef.current = undefined;
+      agentSocketReconnectDeadlineRef.current = undefined;
+      agentSocketReconnectDelayRef.current = AGENT_SOCKET_RECONNECT_INITIAL_MS;
+      agentConnectionIdRef.current = null;
       activeAgentRunIdRef.current = null;
+      agentJobPlaceholdersRef.current.clear();
+      agentOutputPlacementCountsRef.current.clear();
+      window.clearTimeout(agentCopyResetTimerRef.current);
       window.clearTimeout(codexPollTimerRef.current);
     };
   }, []);
@@ -3112,6 +3257,7 @@ export function App() {
       scope: "all"
     });
     editor.on("change", updateReferenceSelection);
+    deleteAgentPlanNodes(editor);
     commitReferenceSelection();
 
     return () => {
@@ -3530,6 +3676,36 @@ export function App() {
     ]);
   }
 
+  async function copyAgentMessage(message: AgentChatMessage): Promise<void> {
+    const text = (message.role === "thinking" ? message.details ?? message.content : message.content).trim();
+    if (!text) {
+      return;
+    }
+
+    try {
+      await writeClipboardText(text);
+      setCopiedAgentMessageId(message.id);
+      if (agentCopyResetTimerRef.current !== undefined) {
+        window.clearTimeout(agentCopyResetTimerRef.current);
+      }
+      agentCopyResetTimerRef.current = window.setTimeout(() => {
+        setCopiedAgentMessageId((currentId) => (currentId === message.id ? null : currentId));
+        agentCopyResetTimerRef.current = undefined;
+      }, 1600);
+    } catch {
+      addAgentMessage({
+        role: "error",
+        content: t("agentCopyMessageFailed")
+      });
+    }
+  }
+
+  function toggleThinkingMessage(messageId: string): void {
+    setExpandedThinkingMessageIds((currentIds) =>
+      currentIds.includes(messageId) ? currentIds.filter((id) => id !== messageId) : [...currentIds, messageId]
+    );
+  }
+
   function isAgentStreamEventForActiveRun(event: Pick<AgentServerEvent, "runId">): boolean {
     const activeRunId = activeAgentRunIdRef.current;
     return Boolean(activeRunId && (!event.runId || event.runId === activeRunId));
@@ -3586,11 +3762,106 @@ export function App() {
     appendAgentStreamDelta("assistant", delta, runId);
   }
 
-  function appendAgentThinkingDelta(delta: string, runId?: string): void {
-    appendAgentStreamDelta("thinking", delta, runId);
+  function upsertAgentThinkingSummary(runId?: string): void {
+    const content =
+      locale === "zh-CN"
+        ? "正在分析任务，整理生图计划与确认节点。"
+        : "Reviewing the request and shaping a generation plan with confirmation steps.";
+    setAgentMessages((messages) => {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message?.role !== "thinking" || message.plan || message.runId !== runId) {
+          continue;
+        }
+
+        if (message.content === content) {
+          return messages;
+        }
+
+        return messages.map((item, itemIndex) =>
+          itemIndex === index
+            ? {
+                ...item,
+                content
+              }
+            : item
+        );
+      }
+
+      return [
+        ...messages,
+        {
+          id: `agent-message-${crypto.randomUUID()}`,
+          role: "thinking",
+          content,
+          timestamp: new Date().toISOString(),
+          runId
+        }
+      ];
+    });
   }
 
-  function upsertAgentPlanAttachment(plan: GenerationPlan, fallbackContent: string, runId?: string): void {
+  function appendAgentThinkingDelta(delta: string, runId?: string): void {
+    if (!delta.trim()) {
+      return;
+    }
+    upsertAgentThinkingSummary(runId);
+  }
+
+  function appendAgentThinkingDetailsDelta(delta: string, runId?: string): void {
+    if (!delta) {
+      return;
+    }
+
+    const content = agentThinkingSummaryText(locale);
+    setAgentMessages((messages) => {
+      let existingIndex = -1;
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message?.role !== "thinking" || message.plan || message.runId !== runId) {
+          continue;
+        }
+
+        existingIndex = index;
+        break;
+      }
+
+      if (existingIndex >= 0) {
+        return messages.map((message, index) =>
+          index === existingIndex
+            ? {
+                ...message,
+                content,
+                details: `${message.details ?? ""}${delta}`
+              }
+            : message
+        );
+      }
+
+      if (!delta.trim()) {
+        return messages;
+      }
+
+      return [
+        ...messages,
+        {
+          id: `agent-message-${crypto.randomUUID()}`,
+          role: "thinking",
+          content,
+          details: delta,
+          timestamp: new Date().toISOString(),
+          runId
+        }
+      ];
+    });
+  }
+
+  function upsertAgentPlanAttachment(
+    plan: GenerationPlan,
+    fallbackContent: string,
+    runId?: string,
+    selectedReferences?: AgentSelectedCanvasReference[]
+  ): void {
     setAgentMessages((messages) => {
       let existingIndex = -1;
       for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -3605,6 +3876,7 @@ export function App() {
           index === existingIndex
             ? {
                 ...message,
+                role: "plan",
                 content: fallbackContent,
                 plan,
                 runId: message.runId ?? runId
@@ -3617,13 +3889,205 @@ export function App() {
         ...messages,
         {
           id: `agent-message-${crypto.randomUUID()}`,
-          role: "assistant",
+          role: "plan",
           content: fallbackContent,
           timestamp: new Date().toISOString(),
           runId,
           plan
         }
       ];
+    });
+  }
+
+  function agentJobPlaceholderKey(planId: string, jobId: string): string {
+    return `${planId}::${jobId}`;
+  }
+
+  function createAgentJobPlaceholderSet(editor: Editor, plan: GenerationPlan, job: GenerationJob, runId?: string): AgentJobPlaceholderSet | undefined {
+    if (job.count <= 0) {
+      return undefined;
+    }
+
+    const placementKey = plan.id;
+    const placementIndex = agentOutputPlacementCountsRef.current.get(placementKey) ?? 0;
+    agentOutputPlacementCountsRef.current.set(placementKey, placementIndex + job.count);
+    agentPlaceholderRequestRef.current += 1;
+
+    const targetSize = job.size ?? plan.defaults.size;
+    const layout = agentPlanOutputLayout(plan);
+    const placements = Array.from({ length: job.count }, (_, index) => agentOutputPlacementForSize(editor, targetSize, placementIndex + index, layout));
+    const placeholderSet = createGenerationPlaceholdersFromPlacements(editor, placements, agentPlaceholderRequestRef.current, {
+      selectPlaceholders: false
+    });
+    const agentPlaceholderSet: AgentJobPlaceholderSet = {
+      planId: plan.id,
+      jobId: job.id,
+      runId,
+      placeholderSet,
+      outputSlots: new Map()
+    };
+
+    agentJobPlaceholdersRef.current.set(agentJobPlaceholderKey(plan.id, job.id), agentPlaceholderSet);
+    return agentPlaceholderSet;
+  }
+
+  function ensureAgentJobPlaceholders(plan: GenerationPlan, job: GenerationJob, runId?: string): void {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+
+    const key = agentJobPlaceholderKey(plan.id, job.id);
+    const existingSet = agentJobPlaceholdersRef.current.get(key);
+    if (existingSet && hasLoadingGenerationPlaceholders(editor, existingSet.placeholderSet)) {
+      return;
+    }
+
+    createAgentJobPlaceholderSet(editor, plan, job, runId);
+  }
+
+  function nextLiveAgentPlaceholderIndex(editor: Editor, agentPlaceholderSet: AgentJobPlaceholderSet): number | undefined {
+    for (let index = 0; index < agentPlaceholderSet.placeholderSet.placements.length; index += 1) {
+      const placement = agentPlaceholderSet.placeholderSet.placements[index];
+      if (placement && isGenerationPlaceholderShape(editor.getShape(placement.id))) {
+        return index;
+      }
+    }
+
+    return undefined;
+  }
+
+  function replaceAgentPlaceholderAtIndex(
+    editor: Editor,
+    agentPlaceholderSet: AgentJobPlaceholderSet,
+    index: number,
+    asset: GeneratedAsset,
+    altText: string
+  ): TLShapeId | undefined {
+    const placement = agentPlaceholderSet.placeholderSet.placements[index];
+    if (!placement || !isGenerationPlaceholderShape(editor.getShape(placement.id))) {
+      return undefined;
+    }
+
+    const imageShape = createImageShape(asset, livePlacement(editor, placement), altText);
+    const assetRecordId = createTldrawAssetId(asset.id);
+
+    editor.run(() => {
+      editor.deleteShapes([placement.id]);
+      if (!editor.getAsset(assetRecordId)) {
+        editor.createAssets([createImageAsset(asset)]);
+      }
+      editor.createShapes([imageShape]);
+      editor.bringToFront([imageShape.id]);
+    });
+
+    return imageShape.id;
+  }
+
+  function replaceAgentPlaceholderWithAsset(event: Extract<AgentServerEvent, { type: "asset_preview" }>): TLShapeId | undefined {
+    const editor = editorRef.current;
+    if (!editor) {
+      return undefined;
+    }
+
+    const key = agentJobPlaceholderKey(event.planId, event.jobId);
+    const agentPlaceholderSet = agentJobPlaceholdersRef.current.get(key);
+    if (!agentPlaceholderSet) {
+      return undefined;
+    }
+
+    const existingSlot = agentPlaceholderSet.outputSlots.get(event.outputId);
+    const outputIndex = existingSlot ?? nextLiveAgentPlaceholderIndex(editor, agentPlaceholderSet);
+    if (outputIndex === undefined) {
+      return undefined;
+    }
+
+    agentPlaceholderSet.outputSlots.set(event.outputId, outputIndex);
+    return replaceAgentPlaceholderAtIndex(editor, agentPlaceholderSet, outputIndex, event.asset, `${event.jobId}: ${event.asset.fileName}`);
+  }
+
+  function finishAgentJobPlaceholdersFromOutputs(event: Extract<AgentServerEvent, { type: "job_completed" }>): void {
+    const editor = editorRef.current;
+    if (!editor || !event.outputs) {
+      return;
+    }
+
+    const key = agentJobPlaceholderKey(event.planId, event.jobId);
+    const agentPlaceholderSet = agentJobPlaceholdersRef.current.get(key);
+    if (!agentPlaceholderSet) {
+      return;
+    }
+
+    event.outputs.forEach((output, index) => {
+      if (output.status !== "succeeded" || !output.asset) {
+        return;
+      }
+
+      const outputIndex = agentPlaceholderSet.outputSlots.get(output.id) ?? index;
+      replaceAgentPlaceholderAtIndex(editor, agentPlaceholderSet, outputIndex, output.asset, `${event.jobId}: ${output.asset.fileName}`);
+    });
+    deleteLoadingGenerationPlaceholders(editor, agentPlaceholderSet.placeholderSet);
+    agentJobPlaceholdersRef.current.delete(key);
+  }
+
+  function markAgentJobPlaceholdersFailed(planId: string, jobId: string, error: string): void {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+
+    const key = agentJobPlaceholderKey(planId, jobId);
+    const agentPlaceholderSet = agentJobPlaceholdersRef.current.get(key);
+    if (!agentPlaceholderSet) {
+      return;
+    }
+
+    markGenerationPlaceholdersFailed(editor, agentPlaceholderSet.placeholderSet, error);
+    agentJobPlaceholdersRef.current.delete(key);
+  }
+
+  function deleteAgentJobLoadingPlaceholdersForRun(runId?: string): void {
+    const editor = editorRef.current;
+    if (!editor) {
+      return;
+    }
+
+    agentJobPlaceholdersRef.current.forEach((agentPlaceholderSet, key) => {
+      if (runId && agentPlaceholderSet.runId !== runId) {
+        return;
+      }
+
+      deleteLoadingGenerationPlaceholders(editor, agentPlaceholderSet.placeholderSet);
+      agentJobPlaceholdersRef.current.delete(key);
+    });
+  }
+
+  function syncAgentJobPlaceholdersForPlan(plan: GenerationPlan, runId?: string): void {
+    plan.jobs.forEach((job) => {
+      if (job.status === "running") {
+        ensureAgentJobPlaceholders(plan, job, runId);
+        return;
+      }
+
+      if (job.status === "failed") {
+        markAgentJobPlaceholdersFailed(plan.id, job.id, job.error ?? t("generationErrorDefault"));
+        return;
+      }
+
+      if (job.status === "blocked") {
+        markAgentJobPlaceholdersFailed(plan.id, job.id, job.error ?? t("agentPlanJobStatusLabel", { status: job.status }));
+        return;
+      }
+
+      if (job.status === "cancelled") {
+        const editor = editorRef.current;
+        const key = agentJobPlaceholderKey(plan.id, job.id);
+        const agentPlaceholderSet = agentJobPlaceholdersRef.current.get(key);
+        if (editor && agentPlaceholderSet) {
+          deleteLoadingGenerationPlaceholders(editor, agentPlaceholderSet.placeholderSet);
+          agentJobPlaceholdersRef.current.delete(key);
+        }
+      }
     });
   }
 
@@ -3636,6 +4100,11 @@ export function App() {
     const existingShapeId = findCanvasImageShapeByAssetId(editor, event.assetId, optionalShapeIdFromEvent(event));
     if (existingShapeId) {
       return existingShapeId;
+    }
+
+    const placeholderShapeId = replaceAgentPlaceholderWithAsset(event);
+    if (placeholderShapeId) {
+      return placeholderShapeId;
     }
 
     const placementKey = event.planId || event.runId || "agent";
@@ -3660,8 +4129,37 @@ export function App() {
     return imageShape.id;
   }
 
+  function rememberAgentOutputReference(event: Extract<AgentServerEvent, { type: "asset_preview" }>, shapeId: TLShapeId | undefined): void {
+    if (!event.runId) {
+      return;
+    }
+
+    const outputs = pendingAgentOutputReferencesRef.current.get(event.runId) ?? [];
+    const nextOutput: RecentAgentOutputReference = {
+      assetId: event.assetId,
+      jobId: event.jobId,
+      outputId: event.outputId,
+      planId: event.planId,
+      shapeId,
+      url: event.url,
+      asset: event.asset
+    };
+    const existingIndex = outputs.findIndex(
+      (output) => output.assetId === event.assetId && output.jobId === event.jobId && output.outputId === event.outputId
+    );
+    const nextOutputs = [...outputs];
+    if (existingIndex >= 0) {
+      nextOutputs[existingIndex] = nextOutput;
+    } else {
+      nextOutputs.push(nextOutput);
+    }
+
+    pendingAgentOutputReferencesRef.current.set(event.runId, nextOutputs);
+  }
+
   function addAgentAssetPreview(event: Extract<AgentServerEvent, { type: "asset_preview" }>): void {
     const shapeId = addAgentOutputAssetToCanvas(event);
+    rememberAgentOutputReference(event, shapeId);
     const preview: AgentChatAssetPreview = {
       id: `agent-preview-${event.jobId}-${event.assetId}-${crypto.randomUUID()}`,
       assetId: event.assetId,
@@ -3698,34 +4196,14 @@ export function App() {
     });
   }
 
-  function syncAgentPlanNodeFromEvent(event: Extract<AgentServerEvent, { type: "plan_created" | "plan_updated" }>): void {
+  function clearCanvasAgentPlanNodes(planId?: string): void {
     const editor = editorRef.current;
-    if (!editor) {
-      addAgentMessage({
-        role: "error",
-        content: t("generationCanvasNotReady")
-      });
-      return;
+    if (planId) {
+      agentOutputPlacementCountsRef.current.delete(planId);
     }
-
-    if (!isGenerationPlan(event.plan)) {
-      addAgentMessage({
-        role: "error",
-        content: t("agentInvalidEvent")
-      });
-      return;
+    if (editor) {
+      deleteAgentPlanNodes(editor);
     }
-
-    if (event.type === "plan_created") {
-      agentOutputPlacementCountsRef.current.delete(event.plan.id);
-    }
-
-    upsertAgentPlanNode({
-      editor,
-      eventType: event.type,
-      lastRunId: event.runId,
-      plan: event.plan
-    });
   }
 
   function handleAgentServerEvent(event: AgentServerEvent): void {
@@ -3740,7 +4218,7 @@ export function App() {
         if (!isAgentStreamEventForActiveRun(event)) {
           return;
         }
-        appendAgentThinkingDelta(event.delta, runIdForAgentEvent(event));
+        appendAgentThinkingDetailsDelta(event.delta, runIdForAgentEvent(event));
         return;
       case "plan_created":
         if (isStaleAgentRunEvent(event)) {
@@ -3754,8 +4232,26 @@ export function App() {
           });
           return;
         }
-        syncAgentPlanNodeFromEvent(event);
-        upsertAgentPlanAttachment(event.plan, t("agentPlanCreated", { title: event.plan.title }), runIdForAgentEvent(event));
+        {
+          const eventRunId = runIdForAgentEvent(event);
+          if (eventRunId) {
+            agentPlanCreatedRunIdsRef.current.add(eventRunId);
+          }
+          const selectedReferences = event.runId ? pendingAgentSelectedReferencesRef.current.get(event.runId) : undefined;
+          if (event.runId) {
+            pendingAgentSelectedReferencesRef.current.delete(event.runId);
+          }
+          if (selectedReferences) {
+            agentPlanSelectedReferencesRef.current.set(event.plan.id, selectedReferences);
+          }
+          clearCanvasAgentPlanNodes(event.plan.id);
+          upsertAgentPlanAttachment(
+            event.plan,
+            t("agentPlanCreated", { title: event.plan.title }),
+            eventRunId,
+            selectedReferences ?? agentPlanSelectedReferencesRef.current.get(event.plan.id)
+          );
+        }
         return;
       case "plan_updated":
         if (isStaleAgentRunEvent(event)) {
@@ -3769,8 +4265,14 @@ export function App() {
           });
           return;
         }
-        syncAgentPlanNodeFromEvent(event);
-        upsertAgentPlanAttachment(event.plan, t("agentPlanUpdated", { title: event.plan.title }), runIdForAgentEvent(event));
+        clearCanvasAgentPlanNodes();
+        syncAgentJobPlaceholdersForPlan(event.plan, runIdForAgentEvent(event));
+        upsertAgentPlanAttachment(
+          event.plan,
+          t("agentPlanUpdated", { title: event.plan.title }),
+          runIdForAgentEvent(event),
+          agentPlanSelectedReferencesRef.current.get(event.plan.id)
+        );
         return;
       case "asset_preview":
         if (isStaleAgentRunEvent(event)) {
@@ -3797,6 +4299,7 @@ export function App() {
             [event.record as GenerationRecord, ...history.filter((record) => record.id !== event.record?.id)].slice(0, 20)
           );
         }
+        finishAgentJobPlaceholdersFromOutputs(event);
         addAgentMessage({
           role: "system",
           content: t("agentJobCompleted", { jobId: event.jobId }),
@@ -3807,6 +4310,7 @@ export function App() {
         if (isStaleAgentRunEvent(event)) {
           return;
         }
+        markAgentJobPlaceholdersFailed(event.planId, event.jobId, event.error);
         addAgentMessage({
           role: "error",
           content: t("agentJobFailed", { jobId: event.jobId, error: event.error }),
@@ -3817,6 +4321,7 @@ export function App() {
         if (isStaleAgentRunEvent(event)) {
           return;
         }
+        markAgentJobPlaceholdersFailed(event.planId, event.jobId, event.reason);
         addAgentMessage({
           role: "error",
           content: t("agentJobBlocked", { jobId: event.jobId, reason: event.reason }),
@@ -3827,8 +4332,18 @@ export function App() {
         if (isStaleAgentRunEvent(event)) {
           return;
         }
+        if (event.runId) {
+          pendingAgentSelectedReferencesRef.current.delete(event.runId);
+          pendingAgentOutputReferencesRef.current.delete(event.runId);
+        }
+        {
+          const eventRunId = runIdForAgentEvent(event);
+          const shouldAskUser = event.recoverable && isAgentUserInputErrorCode(event.code);
+          if (shouldAskUser && eventRunId) {
+            agentUserInputRunIdsRef.current.add(eventRunId);
+          }
         addAgentMessage({
-          role: "error",
+          role: shouldAskUser ? "question" : "error",
           content: localizedApiErrorMessage({
             code: event.code,
             fallbackMessage: event.message,
@@ -3836,19 +4351,28 @@ export function App() {
             locale,
             status: 400
           }),
-          runId: runIdForAgentEvent(event)
+          runId: eventRunId
         });
+        }
+        deleteAgentJobLoadingPlaceholdersForRun(event.runId);
         if (event.runId && activeAgentRunIdRef.current === event.runId) {
           activeAgentRunIdRef.current = null;
           setAgentRunStatus("idle");
+          resetAgentSocketReconnectState();
         }
         return;
       case "run_cancelled":
         if (isStaleAgentRunEvent(event)) {
           return;
         }
+        if (event.runId) {
+          pendingAgentSelectedReferencesRef.current.delete(event.runId);
+          pendingAgentOutputReferencesRef.current.delete(event.runId);
+        }
         activeAgentRunIdRef.current = null;
         setAgentRunStatus("idle");
+        resetAgentSocketReconnectState();
+        deleteAgentJobLoadingPlaceholdersForRun(event.runId);
         addAgentMessage({
           role: "system",
           content: event.alreadyCancelled ? t("agentRunAlreadyCancelled") : t("agentRunCancelled"),
@@ -3859,26 +4383,117 @@ export function App() {
         if (isStaleAgentRunEvent(event)) {
           return;
         }
+        if (event.runId) {
+          pendingAgentSelectedReferencesRef.current.delete(event.runId);
+          const completedOutputReferences = pendingAgentOutputReferencesRef.current.get(event.runId);
+          if (event.status === "succeeded" && completedOutputReferences?.length) {
+            recentSuccessfulAgentOutputReferencesRef.current = completedOutputReferences.slice(0, MAX_AGENT_SELECTED_REFERENCES);
+          }
+          pendingAgentOutputReferencesRef.current.delete(event.runId);
+        }
         if (!event.runId || activeAgentRunIdRef.current === event.runId) {
           activeAgentRunIdRef.current = null;
           setAgentRunStatus("idle");
+          resetAgentSocketReconnectState();
         }
+        if (event.status === "cancelled") {
+          deleteAgentJobLoadingPlaceholdersForRun(event.runId);
+        }
+        {
+          const eventRunId = runIdForAgentEvent(event);
+          if (event.status === "succeeded" && eventRunId && agentPlanCreatedRunIdsRef.current.delete(eventRunId)) {
+            return;
+          }
+          if (event.status === "failed" && eventRunId && agentUserInputRunIdsRef.current.delete(eventRunId)) {
+            return;
+          }
         addAgentMessage({
           role: event.status === "succeeded" ? "system" : "error",
           content: t("agentRunDone", { status: event.status }),
-          runId: runIdForAgentEvent(event)
+          runId: eventRunId
         });
+        }
         return;
       case "connected":
+        agentConnectionIdRef.current = event.connectionId;
+        return;
       case "pong":
       default:
         return;
     }
   }
 
+  function clearAgentSocketReconnectTimer(): void {
+    window.clearTimeout(agentSocketReconnectTimerRef.current);
+    agentSocketReconnectTimerRef.current = undefined;
+  }
+
+  function resetAgentSocketReconnectState(): void {
+    clearAgentSocketReconnectTimer();
+    agentSocketReconnectDeadlineRef.current = undefined;
+    agentSocketReconnectDelayRef.current = AGENT_SOCKET_RECONNECT_INITIAL_MS;
+  }
+
+  function failAgentSocketReconnect(runId: string): void {
+    if (activeAgentRunIdRef.current !== runId) {
+      return;
+    }
+
+    activeAgentRunIdRef.current = null;
+    setAgentRunStatus("idle");
+    stopAgentSocketHeartbeat();
+    resetAgentSocketReconnectState();
+    deleteAgentJobLoadingPlaceholdersForRun(runId);
+    addAgentMessage({
+      role: "error",
+      content: t("agentSocketClosed"),
+      runId
+    });
+  }
+
+  function scheduleAgentSocketReconnect(runId: string): void {
+    clearAgentSocketReconnectTimer();
+    if (activeAgentRunIdRef.current !== runId) {
+      return;
+    }
+
+    const now = Date.now();
+    const deadline = agentSocketReconnectDeadlineRef.current ?? now + AGENT_SOCKET_RECONNECT_WINDOW_MS;
+    agentSocketReconnectDeadlineRef.current = deadline;
+    const remainingMs = deadline - now;
+    if (remainingMs <= 0) {
+      failAgentSocketReconnect(runId);
+      return;
+    }
+
+    setAgentRunStatus("connecting");
+    const delayMs = Math.min(agentSocketReconnectDelayRef.current, remainingMs);
+    agentSocketReconnectTimerRef.current = window.setTimeout(() => {
+      agentSocketReconnectTimerRef.current = undefined;
+      if (activeAgentRunIdRef.current !== runId) {
+        return;
+      }
+
+      void ensureAgentSocket()
+        .then(() => {
+          if (activeAgentRunIdRef.current === runId) {
+            setAgentRunStatus("running");
+          }
+        })
+        .catch(() => {
+          if (activeAgentRunIdRef.current !== runId) {
+            return;
+          }
+          agentSocketReconnectDelayRef.current = Math.min(agentSocketReconnectDelayRef.current * 2, AGENT_SOCKET_RECONNECT_MAX_MS);
+          scheduleAgentSocketReconnect(runId);
+        });
+    }, delayMs);
+  }
+
   function ensureAgentSocket(): Promise<WebSocket> {
     const existingSocket = agentSocketRef.current;
     if (existingSocket?.readyState === WebSocket.OPEN) {
+      startAgentSocketHeartbeat(existingSocket);
       return Promise.resolve(existingSocket);
     }
     if (existingSocket?.readyState === WebSocket.CONNECTING && agentSocketOpenPromiseRef.current) {
@@ -3886,13 +4501,15 @@ export function App() {
     }
 
     setAgentRunStatus("connecting");
-    const socket = new WebSocket(agentWebSocketUrl());
+    const socket = new WebSocket(agentWebSocketUrl(agentConnectionIdRef.current, activeAgentRunIdRef.current));
     agentSocketRef.current = socket;
 
     const openPromise = new Promise<WebSocket>((resolve, reject) => {
       let settled = false;
 
       socket.onopen = () => {
+        resetAgentSocketReconnectState();
+        startAgentSocketHeartbeat(socket);
         settled = true;
         resolve(socket);
       };
@@ -3912,7 +4529,7 @@ export function App() {
         if (!settled) {
           settled = true;
           reject(new Error(t("agentSocketFailed")));
-        } else {
+        } else if (!activeAgentRunIdRef.current) {
           addAgentMessage({
             role: "error",
             content: t("agentSocketFailed")
@@ -3920,28 +4537,94 @@ export function App() {
         }
       };
       socket.onclose = () => {
-        if (agentSocketRef.current === socket) {
+        const isCurrentSocket = agentSocketRef.current === socket;
+        if (isCurrentSocket) {
           agentSocketRef.current = null;
           agentSocketOpenPromiseRef.current = null;
+        }
+        stopAgentSocketHeartbeat(socket);
+        if (!isCurrentSocket) {
+          return;
         }
         if (!settled) {
           settled = true;
           reject(new Error(t("agentSocketFailed")));
           return;
         }
-        if (activeAgentRunIdRef.current) {
-          activeAgentRunIdRef.current = null;
-          setAgentRunStatus("idle");
-          addAgentMessage({
-            role: "error",
-            content: t("agentSocketClosed")
-          });
+        const activeRunId = activeAgentRunIdRef.current;
+        if (activeRunId) {
+          scheduleAgentSocketReconnect(activeRunId);
         }
       };
     });
 
     agentSocketOpenPromiseRef.current = openPromise;
     return openPromise;
+  }
+
+  function startAgentSocketHeartbeat(socket: WebSocket): void {
+    stopAgentSocketHeartbeat();
+    agentSocketPingTimerRef.current = window.setInterval(() => {
+      if (agentSocketRef.current !== socket || socket.readyState !== WebSocket.OPEN) {
+        stopAgentSocketHeartbeat(socket);
+        return;
+      }
+
+      const runId = activeAgentRunIdRef.current;
+      const pingMessage: { type: "ping"; requestId: string; runId?: string } = {
+        type: "ping",
+        requestId: `agent-heartbeat-${runId ?? "idle"}-${Date.now()}`
+      };
+      if (runId) {
+        pingMessage.runId = runId;
+      }
+
+      // Keep the Agent channel warm even when the browser throttles inactive UI work.
+      socket.send(JSON.stringify(pingMessage));
+    }, AGENT_SOCKET_PING_INTERVAL_MS);
+  }
+
+  function stopAgentSocketHeartbeat(socket?: WebSocket): void {
+    if (socket && agentSocketRef.current && agentSocketRef.current !== socket) {
+      return;
+    }
+
+    window.clearInterval(agentSocketPingTimerRef.current);
+    agentSocketPingTimerRef.current = undefined;
+  }
+
+  function startNewAgentConversation(): void {
+    if (isAgentRunning) {
+      return;
+    }
+
+    const socket = agentSocketRef.current;
+    stopAgentSocketHeartbeat(socket ?? undefined);
+    resetAgentSocketReconnectState();
+    activeAgentRunIdRef.current = null;
+    agentSocketRef.current = null;
+    agentSocketOpenPromiseRef.current = null;
+
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      socket.close(1000, "new_agent_conversation");
+    }
+
+    pendingAgentSelectedReferencesRef.current.clear();
+    agentPlanSelectedReferencesRef.current.clear();
+    pendingAgentOutputReferencesRef.current.clear();
+    recentSuccessfulAgentOutputReferencesRef.current = [];
+    agentPlanCreatedRunIdsRef.current.clear();
+    agentUserInputRunIdsRef.current.clear();
+    agentOutputPlacementCountsRef.current.clear();
+    deleteAgentJobLoadingPlaceholdersForRun();
+    agentJobPlaceholdersRef.current.clear();
+    clearCanvasAgentPlanNodes();
+    setAgentMessages([]);
+    setExpandedThinkingMessageIds([]);
+    setCopiedAgentMessageId(null);
+    setAgentInput("");
+    setIsAgentSettingsOpen(false);
+    setAgentRunStatus("idle");
   }
 
   function selectAgentSizePreset(nextPresetId: string): void {
@@ -4004,11 +4687,25 @@ export function App() {
     });
 
     try {
-      const selectedReferences = await buildAgentSelectedReferences({
-        references: agentReferenceSelection.references,
-        supportsVision: Boolean(agentConfig?.supportsVision),
-        t
-      });
+      let selectedReferences: AgentSelectedCanvasReference[] = [];
+      if (agentReferenceSelection.references.length > 0) {
+        selectedReferences = await buildAgentSelectedReferences({
+          references: agentReferenceSelection.references,
+          t
+        });
+      } else if (
+        recentSuccessfulAgentOutputReferencesRef.current.length > 0 &&
+        shouldUseRecentAgentOutputsForAgentEdit(trimmedAgentInput)
+      ) {
+        selectedReferences = buildRecentAgentOutputSelectedReferences(recentSuccessfulAgentOutputReferencesRef.current);
+        addAgentMessage({
+          role: "system",
+          content: t("agentUsingRecentOutputs", { count: selectedReferences.length }),
+          runId
+        });
+      }
+
+      pendingAgentSelectedReferencesRef.current.set(runId, selectedReferences);
       const socket = await ensureAgentSocket();
       socket.send(
         JSON.stringify({
@@ -4017,14 +4714,18 @@ export function App() {
           runId,
           text: trimmedAgentInput,
           defaults: agentDefaults,
+          plannerOptions: supportsAgentThinkingControls ? agentPlannerOptions : undefined,
           selectedReferences,
           selectedReferenceIds: selectedReferences.map((reference) => reference.assetId)
         })
       );
       setAgentRunStatus("running");
     } catch (error) {
+      pendingAgentSelectedReferencesRef.current.delete(runId);
       activeAgentRunIdRef.current = null;
       setAgentRunStatus("idle");
+      stopAgentSocketHeartbeat();
+      resetAgentSocketReconnectState();
       addAgentMessage({
         role: "error",
         content: error instanceof Error ? error.message : t("agentSendFailed")
@@ -4038,6 +4739,8 @@ export function App() {
     if (!runId || !socket || socket.readyState !== WebSocket.OPEN) {
       activeAgentRunIdRef.current = null;
       setAgentRunStatus("idle");
+      stopAgentSocketHeartbeat();
+      resetAgentSocketReconnectState();
       addAgentMessage({
         role: "system",
         content: t("agentRunCancelled")
@@ -4054,10 +4757,10 @@ export function App() {
     );
   }
 
-  async function sendAgentPlanNodeAction(detail: AgentPlanNodeActionDetail): Promise<void> {
-    if (detail.action === "cancel") {
+  async function sendAgentPlanAction(plan: GenerationPlan, action: AgentPlanAction): Promise<void> {
+    if (action === "cancel") {
       try {
-        const runId = detail.lastRunId || activeAgentRunIdRef.current || undefined;
+        const runId = activeAgentRunIdRef.current || undefined;
         const socket = agentSocketRef.current?.readyState === WebSocket.OPEN ? agentSocketRef.current : await ensureAgentSocket();
         socket.send(
           JSON.stringify({
@@ -4075,6 +4778,14 @@ export function App() {
       return;
     }
 
+    if (isAgentRunning) {
+      addAgentMessage({
+        role: "error",
+        content: t("agentPlanActionBusy")
+      });
+      return;
+    }
+
     if (!isAgentConfigured) {
       addAgentMessage({
         role: "error",
@@ -4088,38 +4799,26 @@ export function App() {
     setAgentRunStatus("connecting");
 
     try {
+      let selectedReferences = agentPlanSelectedReferencesRef.current.get(plan.id);
+      if (!selectedReferences && agentReferenceSelection.references.length > 0) {
+        selectedReferences = await buildAgentSelectedReferences({
+          references: agentReferenceSelection.references,
+          t
+        });
+      }
       const socket = await ensureAgentSocket();
-      const editor = editorRef.current;
-      const shape = editor?.getShape(detail.shapeId as TLShapeId);
-      let planForExecution: GenerationPlan | undefined;
-      if (editor && isAgentPlanNodeShape(shape)) {
-        const props = normalizeAgentPlanNodePropsForSnapshot(shape.props);
-        if (isGenerationPlan(props.plan)) {
-          planForExecution = props.plan;
-        }
-        editor.updateShapes<AgentPlanNodeShape>([
-          {
-            id: shape.id,
-            type: AGENT_PLAN_NODE_TYPE,
-            props: {
-              lastRunId: runId,
-              selectedJobId: props.selectedJobId
-            }
-          }
-        ]);
+      clearCanvasAgentPlanNodes();
+      if (selectedReferences) {
+        agentPlanSelectedReferencesRef.current.set(plan.id, selectedReferences);
       }
-
-      if (!planForExecution) {
-        throw new Error(t("agentInvalidEvent"));
-      }
-
       socket.send(
         JSON.stringify({
-          type: detail.action === "execute" ? "execute_plan" : "retry_failed",
+          type: action === "execute" ? "execute_plan" : "retry_failed",
           requestId: `agent-plan-action-${crypto.randomUUID()}`,
           runId,
-          planId: detail.planId,
-          plan: planForExecution
+          planId: plan.id,
+          plan,
+          selectedReferences
         })
       );
       setAgentRunStatus("running");
@@ -4128,65 +4827,12 @@ export function App() {
         activeAgentRunIdRef.current = null;
       }
       setAgentRunStatus("idle");
+      stopAgentSocketHeartbeat();
+      resetAgentSocketReconnectState();
       addAgentMessage({
         role: "error",
         content: error instanceof Error ? error.message : t("agentSendFailed")
       });
-    }
-  }
-
-  useEffect(() => {
-    const handleAgentPlanNodeAction = (event: Event): void => {
-      const detail = (event as CustomEvent<AgentPlanNodeActionDetail>).detail;
-      if (!detail || typeof detail.planId !== "string" || typeof detail.shapeId !== "string") {
-        return;
-      }
-
-      void sendAgentPlanNodeAction(detail);
-    };
-
-    window.addEventListener(AGENT_PLAN_NODE_ACTION_EVENT, handleAgentPlanNodeAction);
-    return () => {
-      window.removeEventListener(AGENT_PLAN_NODE_ACTION_EVENT, handleAgentPlanNodeAction);
-    };
-  });
-
-  function locateAgentPlan(planPayload: unknown): void {
-    if (!isGenerationPlan(planPayload)) {
-      addAgentMessage({
-        role: "error",
-        content: t("agentPlanLocateInvalid")
-      });
-      return;
-    }
-
-    const editor = editorRef.current;
-    if (!editor) {
-      addAgentMessage({
-        role: "error",
-        content: t("generationCanvasNotReady")
-      });
-      return;
-    }
-
-    const result = findLatestAgentPlanNodeForActivation(editor, planPayload.id);
-    if (result.status !== "found") {
-      addAgentMessage({
-        role: "error",
-        content: result.status === "malformed" ? t("agentPlanLocateMalformed") : t("agentPlanLocateMissing")
-      });
-      return;
-    }
-
-    const bounds = editor.getShapePageBounds(result.shape);
-    editor.select(result.shape.id);
-    if (bounds) {
-      editor.zoomToBounds(bounds, {
-        animation: { duration: 220 },
-        inset: 96
-      });
-    } else {
-      editor.zoomToSelection({ animation: { duration: 220 } });
     }
   }
 
@@ -4888,16 +5534,30 @@ export function App() {
                 <span>{agentConfigError || (isAgentConfigured ? t("agentConfigReadyCopy", { model: agentConfig?.model ?? "" }) : t("agentOpenModelConfig"))}</span>
               </span>
             </button>
-            <button
-              aria-label={t("agentConfigRefresh")}
-              className="agent-icon-button"
-              data-testid="agent-config-refresh"
-              disabled={isAgentConfigLoading}
-              type="button"
-              onClick={() => void loadAgentConfig()}
-            >
-              {isAgentConfigLoading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <RotateCcw className="size-4" aria-hidden="true" />}
-            </button>
+            <div className="agent-chat-head__actions">
+              <button
+                aria-label={t("agentConfigRefresh")}
+                className="agent-icon-button"
+                data-testid="agent-config-refresh"
+                disabled={isAgentConfigLoading}
+                title={t("agentConfigRefresh")}
+                type="button"
+                onClick={() => void loadAgentConfig()}
+              >
+                {isAgentConfigLoading ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <RotateCcw className="size-4" aria-hidden="true" />}
+              </button>
+              <button
+                aria-label={t("agentNewConversation")}
+                className="agent-icon-button"
+                data-testid="agent-new-conversation"
+                disabled={isAgentRunning}
+                title={t("agentNewConversation")}
+                type="button"
+                onClick={startNewAgentConversation}
+              >
+                <MessageCirclePlus className="size-4" aria-hidden="true" />
+              </button>
+            </div>
           </div>
 
           <section className="agent-transcript" aria-label={t("agentTranscriptLabel")} data-testid="agent-transcript" ref={agentTranscriptRef}>
@@ -4908,45 +5568,103 @@ export function App() {
                 <span>{t("agentEmptyCopy")}</span>
               </div>
             ) : (
-              agentMessages.map((message) => (
-                <article
-                  className={`agent-message agent-message--${message.role}`}
-                  data-message-role={message.role}
-                  data-run-id={message.runId}
-                  data-testid="agent-message"
-                  key={message.id}
-                >
-                  {message.role === "system" || message.role === "error" ? (
-                    <div className="agent-status-line__meta">
-                      <span>{t("agentMessageRole", { role: message.role })}</span>
-                      <time dateTime={message.timestamp}>{formatDateTime(message.timestamp, { hour: "2-digit", minute: "2-digit" })}</time>
-                    </div>
-                  ) : (
-                    <div className="agent-message__meta">
-                      <span>{t("agentMessageRole", { role: message.role })}</span>
-                      <time dateTime={message.timestamp}>{formatDateTime(message.timestamp, { hour: "2-digit", minute: "2-digit" })}</time>
-                    </div>
-                  )}
-                  <p className="agent-message__content">{message.content}</p>
-                  {message.plan ? <AgentPlanCard onLocate={locateAgentPlan} plan={message.plan} t={t} /> : null}
-                  {message.previews?.length ? (
-                    <div className="agent-preview-list">
-                      {message.previews.map((preview) => (
+              agentMessages.map((message) => {
+                const canCopyAgentMessage = isCopyableAgentMessageRole(message.role) && message.content.trim().length > 0;
+                const isAgentMessageCopied = copiedAgentMessageId === message.id;
+                const copyMessageLabel = isAgentMessageCopied ? t("agentCopiedMessage") : t("agentCopyMessage");
+                const hasThinkingDetails = message.role === "thinking" && Boolean(message.details?.trim());
+                const isThinkingExpanded = hasThinkingDetails && expandedThinkingMessageIds.includes(message.id);
+                const thinkingToggleLabel = hasThinkingDetails ? agentThinkingRawToggleLabel(locale, isThinkingExpanded) : "";
+                const previewCount = message.previews?.length ?? 0;
+
+                return (
+                  <article
+                    className={`agent-message agent-message--${message.role}`}
+                    data-message-role={message.role}
+                    data-run-id={message.runId}
+                    data-testid="agent-message"
+                    key={message.id}
+                  >
+                    {message.role === "system" || message.role === "error" ? (
+                      <div className="agent-status-line__meta">
+                        <span>{t("agentMessageRole", { role: message.role })}</span>
+                        <time dateTime={message.timestamp}>{formatDateTime(message.timestamp, { hour: "2-digit", minute: "2-digit" })}</time>
+                      </div>
+                    ) : (
+                      <div className="agent-message__meta">
+                        <span>{t("agentMessageRole", { role: message.role })}</span>
+                        <span className="agent-message__meta-actions">
+                          <time dateTime={message.timestamp}>{formatDateTime(message.timestamp, { hour: "2-digit", minute: "2-digit" })}</time>
+                          {canCopyAgentMessage ? (
+                            <button
+                              aria-label={copyMessageLabel}
+                              className="agent-message-copy-button"
+                              data-copied={isAgentMessageCopied}
+                              title={copyMessageLabel}
+                              type="button"
+                              onClick={() => void copyAgentMessage(message)}
+                            >
+                              <Copy className="size-3.5" aria-hidden="true" />
+                            </button>
+                          ) : null}
+                        </span>
+                      </div>
+                    )}
+                    <p className="agent-message__content">{message.content}</p>
+                    {hasThinkingDetails ? (
+                      <div className="agent-thinking-details">
                         <button
-                          aria-label={t("agentPreviewLocate")}
-                          className="agent-preview-button"
-                          key={preview.id}
+                          aria-expanded={isThinkingExpanded}
+                          aria-label={thinkingToggleLabel}
+                          className="agent-thinking-details__toggle"
+                          data-testid="agent-thinking-toggle"
                           type="button"
-                          onClick={() => locateAgentPreview(preview)}
+                          onClick={() => toggleThinkingMessage(message.id)}
                         >
-                          <img alt="" src={preview.url} />
-                          <MapPin className="size-3.5" aria-hidden="true" />
+                          <span>{thinkingToggleLabel}</span>
+                          <ChevronDown className="size-3.5" aria-hidden="true" data-expanded={isThinkingExpanded} />
                         </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </article>
-              ))
+                        {isThinkingExpanded ? (
+                          <pre className="agent-thinking-details__content" data-testid="agent-thinking-content">
+                            {message.details}
+                          </pre>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {message.plan ? (
+                      <AgentPlanCard
+                        isAgentConfigured={isAgentConfigured}
+                        isAgentRunning={isAgentRunning}
+                        plan={message.plan}
+                        t={t}
+                        onAction={(plan, action) => void sendAgentPlanAction(plan, action)}
+                      />
+                    ) : null}
+                    {previewCount > 0 && message.previews ? (
+                      <details className="agent-preview-disclosure">
+                        <summary className="agent-preview-disclosure__summary">
+                          <span>{agentPreviewDisclosureLabel(locale, previewCount)}</span>
+                          <ChevronDown className="agent-preview-disclosure__icon size-3.5" aria-hidden="true" />
+                        </summary>
+                        <div className="agent-preview-list">
+                          {message.previews.map((preview) => (
+                            <button
+                              aria-label={t("agentPreviewLocate")}
+                              className="agent-preview-button"
+                              key={preview.id}
+                              type="button"
+                              onClick={() => locateAgentPreview(preview)}
+                            >
+                              <img alt="" src={preview.url} />
+                              <MapPin className="size-3.5" aria-hidden="true" />
+                            </button>
+                          ))}
+                        </div>
+                      </details>
+                    ) : null}
+                  </article>
+                );
+              })
             )}
           </section>
         </div>
@@ -4974,6 +5692,18 @@ export function App() {
                 <ImageIcon className="size-3.5" aria-hidden="true" />
                 <span>{agentFormatSummary}</span>
               </button>
+              {supportsAgentThinkingControls ? (
+                <button
+                  className="agent-param-chip"
+                  data-testid="agent-thinking-chip"
+                  title={agentThinkingSummary}
+                  type="button"
+                  onClick={() => setIsAgentSettingsOpen((isOpen) => !isOpen)}
+                >
+                  <BrainCircuit className="size-3.5" aria-hidden="true" />
+                  <span>{agentThinkingSummary}</span>
+                </button>
+              ) : null}
               <button
                 className="agent-param-chip"
                 data-testid="agent-reference-state"
@@ -5076,12 +5806,71 @@ export function App() {
                   {agentDefaultsValidationMessage}
                 </p>
               ) : null}
+              {supportsAgentThinkingControls ? (
+                <section className="agent-thinking-controls" aria-label={agentThinkingModeLabel(locale)} data-testid="agent-thinking-controls">
+                  <div className="agent-thinking-controls__header">
+                    <div>
+                      <strong>{agentThinkingModeLabel(locale)}</strong>
+                      <span>{agentThinkingSummary}</span>
+                    </div>
+                  </div>
+                  <div className="agent-thinking-controls__group" role="group" aria-label={agentThinkingModeLabel(locale)}>
+                    <button
+                      aria-pressed={agentThinkingType === "enabled"}
+                      className="agent-thinking-controls__option"
+                      data-selected={agentThinkingType === "enabled"}
+                      data-testid="agent-thinking-enabled"
+                      type="button"
+                      onClick={() => setAgentThinkingType("enabled")}
+                    >
+                      {agentThinkingEnabledLabel(locale)}
+                    </button>
+                    <button
+                      aria-pressed={agentThinkingType === "disabled"}
+                      className="agent-thinking-controls__option"
+                      data-selected={agentThinkingType === "disabled"}
+                      data-testid="agent-thinking-disabled"
+                      type="button"
+                      onClick={() => setAgentThinkingType("disabled")}
+                    >
+                      {agentThinkingDisabledLabel(locale)}
+                    </button>
+                  </div>
+                  <div className="agent-thinking-controls__effort">
+                    <span className="control-label">{agentThinkingEffortLabel(locale)}</span>
+                    <div className="agent-thinking-controls__group" role="group" aria-label={agentThinkingEffortLabel(locale)}>
+                      <button
+                        aria-pressed={agentReasoningEffort === "high"}
+                        className="agent-thinking-controls__option"
+                        data-selected={agentReasoningEffort === "high"}
+                        data-testid="agent-thinking-effort-high"
+                        disabled={agentThinkingType === "disabled"}
+                        type="button"
+                        onClick={() => setAgentReasoningEffort("high")}
+                      >
+                        High
+                      </button>
+                      <button
+                        aria-pressed={agentReasoningEffort === "max"}
+                        className="agent-thinking-controls__option"
+                        data-selected={agentReasoningEffort === "max"}
+                        data-testid="agent-thinking-effort-max"
+                        disabled={agentThinkingType === "disabled"}
+                        type="button"
+                        onClick={() => setAgentReasoningEffort("max")}
+                      >
+                        Max
+                      </button>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
               <div className="agent-reference-summary">
                 <div>
                   <strong>{t("agentReferencesTitle")}</strong>
                   <span>{agentReferenceSelection.hint}</span>
                 </div>
-                <span>{agentReferenceSelection.references.length} / {MAX_REFERENCE_IMAGES}</span>
+                <span>{agentReferenceSelection.references.length} / {MAX_AGENT_SELECTED_REFERENCES}</span>
               </div>
               {agentReferenceSelection.warning ? (
                 <p className="agent-inline-warning" data-testid="agent-reference-warning" role="alert">

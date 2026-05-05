@@ -357,7 +357,7 @@ const webDistRoot = relative(process.cwd(), runtimePaths.webDistDir) || ".";
 
 app.get(
   "/api/agent/ws",
-  upgradeWebSocket(() => createAgentWebSocketEvents(), {
+  upgradeWebSocket((c) => createAgentWebSocketEvents(c.req.query("connectionId"), c.req.query("runId")), {
     onError(error) {
       console.error("Agent WebSocket error.", error);
     }

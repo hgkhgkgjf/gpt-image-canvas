@@ -349,25 +349,29 @@ async function resolveGenerationReference(
 }
 
 async function storedAssetReference(assetId: string): Promise<{ referenceImage: ReferenceImageInput; assetId: string } | undefined> {
-  const stored = await readStoredAsset(assetId);
-  if (!stored) {
-    return undefined;
+  for (const candidateAssetId of storedAssetIdCandidates(assetId)) {
+    const stored = await readStoredAsset(candidateAssetId);
+    if (!stored) {
+      continue;
+    }
+
+    return {
+      referenceImage: {
+        dataUrl: `data:${stored.file.mimeType};base64,${stored.bytes.toString("base64")}`,
+        fileName: stored.file.fileName
+      },
+      assetId: stored.file.id
+    };
   }
 
-  return {
-    referenceImage: {
-      dataUrl: `data:${stored.file.mimeType};base64,${stored.bytes.toString("base64")}`,
-      fileName: stored.file.fileName
-    },
-    assetId: stored.file.id
-  };
+  return undefined;
 }
 
 function selectedReferenceFor(
   reference: GenerationReference,
   selectedReferencesByKey: Map<string, AgentSelectedCanvasReference>
 ): AgentSelectedCanvasReference | undefined {
-  const keys = [reference.assetId, reference.label].filter((key): key is string => Boolean(key));
+  const keys = [...selectedReferenceLookupKeys(reference.assetId), ...selectedReferenceLookupKeys(reference.label)];
   for (const key of keys) {
     const selected = selectedReferencesByKey.get(key);
     if (selected) {
@@ -380,15 +384,47 @@ function selectedReferenceFor(
 
 function createSelectedReferenceMap(references: AgentSelectedCanvasReference[]): Map<string, AgentSelectedCanvasReference> {
   const map = new Map<string, AgentSelectedCanvasReference>();
-  for (const reference of references) {
-    map.set(reference.id, reference);
-    map.set(reference.assetId, reference);
-    if (reference.label) {
-      map.set(reference.label, reference);
-    }
-  }
+  references.forEach((reference, index) => {
+    addSelectedReferenceMapEntries(map, reference, reference.id);
+    addSelectedReferenceMapEntries(map, reference, reference.assetId);
+    addSelectedReferenceMapEntries(map, reference, reference.label);
+    addSelectedReferenceMapEntries(map, reference, `${index + 1}`);
+    addSelectedReferenceMapEntries(map, reference, `ref${index + 1}`);
+    addSelectedReferenceMapEntries(map, reference, `selected-${index + 1}`);
+  });
 
   return map;
+}
+
+function addSelectedReferenceMapEntries(
+  map: Map<string, AgentSelectedCanvasReference>,
+  reference: AgentSelectedCanvasReference,
+  value: string | undefined
+): void {
+  for (const key of selectedReferenceLookupKeys(value)) {
+    if (!map.has(key)) {
+      map.set(key, reference);
+    }
+  }
+}
+
+function selectedReferenceLookupKeys(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return [...storedAssetIdCandidates(value), value.trim()].filter((key, index, keys) => key && keys.indexOf(key) === index);
+}
+
+function storedAssetIdCandidates(assetId: string): string[] {
+  const trimmed = assetId.trim();
+  const candidates = [trimmed];
+  const tldrawAssetMatch = /^asset:(.+)$/u.exec(trimmed);
+  if (tldrawAssetMatch?.[1]) {
+    candidates.push(tldrawAssetMatch[1]);
+  }
+
+  return candidates.filter((candidate, index) => candidate && candidates.indexOf(candidate) === index);
 }
 
 function dependenciesSucceeded(plan: GenerationPlan, jobId: string): boolean {

@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AgentServerEvent, GenerationPlan } from "./contracts.js";
+import type { AgentSelectedCanvasReference, AgentServerEvent, GenerationPlan } from "./contracts.js";
 import type { EditImageProviderInput, ImageProvider, ImageProviderInput, ProviderResult } from "./image-provider.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -42,6 +42,76 @@ async function main(): Promise<void> {
       expect(successProvider.generateCalls === 1, "anchor job uses text-to-image generation");
       expect(successProvider.editCalls === 1, "downstream generated reference uses edit generation");
       expect(events.filter((event) => event.type === "asset_preview").length === 2, "each generated asset emits a preview");
+
+      const selectedAssetId = success.plan.jobs[0]?.outputs[0]?.asset?.id;
+      expect(selectedAssetId, "successful fixture creates a stored asset for selected reference checks");
+      const selectedProvider = new FakeImageProvider();
+      const selectedReference = {
+        id: "selected-1",
+        assetId: `asset:${selectedAssetId}`,
+        label: "Selected fixture"
+      } satisfies AgentSelectedCanvasReference;
+      const selectedReferencePlan = selectedReferencePlanFixture(`asset:${selectedAssetId}`);
+      const selectedReferenceRun = await executeGenerationPlan({
+        plan: selectedReferencePlan,
+        selectedReferences: [selectedReference],
+        mode: "execute",
+        provider: selectedProvider,
+        requestId: "smoke-selected-reference",
+        runId: "run-selected-reference",
+        signal: new AbortController().signal,
+        isRunActive: () => true,
+        sendEvent: () => undefined
+      });
+      expect(selectedReferenceRun.status === "succeeded", "selected references with tldraw asset: prefix resolve to stored assets");
+      expect(selectedProvider.editCalls === 1, "selected reference run uses edit generation");
+
+      const localSelectedProvider = new FakeImageProvider();
+      const localSelectedReference = {
+        id: "selected-local-1",
+        assetId: "local-only-reference",
+        label: "Local canvas image",
+        mimeType: "image/png",
+        dataUrl: `data:image/png;base64,${tinyPngBase64}`
+      } satisfies AgentSelectedCanvasReference;
+      const localSelectedReferenceRun = await executeGenerationPlan({
+        plan: selectedReferencePlanFixture("local-only-reference"),
+        selectedReferences: [localSelectedReference],
+        mode: "execute",
+        provider: localSelectedProvider,
+        requestId: "smoke-local-selected-reference",
+        runId: "run-local-selected-reference",
+        signal: new AbortController().signal,
+        isRunActive: () => true,
+        sendEvent: () => undefined
+      });
+      expect(localSelectedReferenceRun.status === "succeeded", "selected references with local-only asset ids are persisted before edit generation");
+      expect(localSelectedProvider.editCalls === 1, "local-only selected reference run still uses edit generation");
+
+      const multiSelectedProvider = new FakeImageProvider();
+      const multiSelectedRun = await executeGenerationPlan({
+        plan: multiSelectedReferencePlanFixture(),
+        selectedReferences: [
+          localSelectedReference,
+          {
+            id: "selected-local-2",
+            assetId: "local-only-reference-2",
+            label: "Second local canvas image",
+            mimeType: "image/png",
+            dataUrl: `data:image/png;base64,${tinyPngBase64}`
+          }
+        ],
+        mode: "execute",
+        provider: multiSelectedProvider,
+        requestId: "smoke-multi-selected-reference",
+        runId: "run-multi-selected-reference",
+        signal: new AbortController().signal,
+        isRunActive: () => true,
+        sendEvent: () => undefined
+      });
+      expect(multiSelectedRun.status === "succeeded", "multiple independent selected-reference jobs succeed");
+      expect(multiSelectedProvider.generateCalls === 0, "multiple selected-reference jobs do not call text generation");
+      expect(multiSelectedProvider.editCalls === 2, "multiple selected-reference jobs each use edit generation");
 
       const retryProvider = new FakeImageProvider();
       const retryPlan = clonePlan(success.plan);
@@ -175,6 +245,104 @@ function planFixture(id = "plan-smoke"): GenerationPlan {
         toJobId: "final_scene"
       }
     ],
+    createdBy: "agent",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function selectedReferencePlanFixture(assetId: string): GenerationPlan {
+  const now = "2026-01-01T00:00:00.000Z";
+  return {
+    schemaVersion: 1,
+    id: "plan-selected-reference-smoke",
+    title: "Selected reference smoke plan",
+    status: "awaiting_confirmation",
+    defaults: {
+      size: {
+        width: 1024,
+        height: 1024
+      },
+      quality: "auto",
+      outputFormat: "png",
+      count: 1
+    },
+    jobs: [
+      {
+        id: "final_from_selected",
+        role: "final_image",
+        prompt: "Create one final image from the selected canvas reference.",
+        count: 1,
+        references: [
+          {
+            kind: "selected_canvas_image",
+            usage: "style",
+            assetId
+          }
+        ],
+        status: "queued",
+        outputs: [],
+        visible: true
+      }
+    ],
+    edges: [],
+    createdBy: "agent",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function multiSelectedReferencePlanFixture(): GenerationPlan {
+  const now = "2026-01-01T00:00:00.000Z";
+  return {
+    schemaVersion: 1,
+    id: "plan-multi-selected-reference-smoke",
+    title: "Multiple selected reference smoke plan",
+    status: "awaiting_confirmation",
+    defaults: {
+      size: {
+        width: 1024,
+        height: 1024
+      },
+      quality: "auto",
+      outputFormat: "png",
+      count: 1
+    },
+    jobs: [
+      {
+        id: "caption_selected_1",
+        role: "final_image",
+        prompt: "Edit selected canvas image one directly and add title typography.",
+        count: 1,
+        references: [
+          {
+            kind: "selected_canvas_image",
+            usage: "scene",
+            assetId: "local-only-reference"
+          }
+        ],
+        status: "queued",
+        outputs: [],
+        visible: true
+      },
+      {
+        id: "caption_selected_2",
+        role: "final_image",
+        prompt: "Edit selected canvas image two directly and add title typography.",
+        count: 1,
+        references: [
+          {
+            kind: "selected_canvas_image",
+            usage: "scene",
+            assetId: "local-only-reference-2"
+          }
+        ],
+        status: "queued",
+        outputs: [],
+        visible: true
+      }
+    ],
+    edges: [],
     createdBy: "agent",
     createdAt: now,
     updatedAt: now
