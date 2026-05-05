@@ -41,34 +41,31 @@
 }
 
 .brand-mark {
-  position: relative;
   display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
   width: 2rem;
   height: 2rem;
   flex: none;
   border-radius: 0.55rem;
-  background: linear-gradient(135deg, var(--brand-blue) 0%, var(--brand-blue-dark) 62%, var(--brand-cyan) 100%);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.22), 0 10px 22px rgb(37 99 235 / 0.2);
+  background: rgb(255 253 248 / 0.72);
+  box-shadow: 0 10px 22px rgb(126 50 26 / 0.18);
 }
 
 .brand-mark::before {
-  content: "";
-  position: absolute;
-  inset: 0.42rem;
-  border: 1.5px solid rgb(255 255 255 / 0.88);
-  border-radius: 0.25rem;
+  content: none;
 }
 
 .brand-mark::after {
-  content: "";
-  position: absolute;
-  right: 0.38rem;
-  bottom: 0.38rem;
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 0.15rem;
-  background: #67e8f9;
-  box-shadow: -0.48rem -0.4rem 0 -0.18rem rgb(255 255 255 / 0.92);
+  content: none;
+}
+
+.brand-mark__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .brand-mark--large {

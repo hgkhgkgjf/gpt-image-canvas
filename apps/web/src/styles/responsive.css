@@ -37,49 +37,6 @@
     height: clamp(15rem, 58vw, 24rem);
   }
 
-  .home-hero {
-    min-height: auto;
-    align-items: flex-start;
-    flex-direction: column;
-    padding: 2.4rem 1rem 1.4rem;
-  }
-
-  .home-hero::before {
-    background:
-      linear-gradient(180deg, #fffaf1 0%, rgb(255 250 241 / 0.9) 54%, rgb(247 240 229 / 0.78) 100%),
-      linear-gradient(90deg, transparent, rgb(15 118 110 / 0.08));
-  }
-
-  .home-hero__copy {
-    order: 1;
-    padding-top: 0;
-  }
-
-  .home-hero__visual {
-    position: relative;
-    top: auto;
-    right: auto;
-    order: 2;
-    z-index: 0;
-    width: 100%;
-    height: 20rem;
-    min-height: 0;
-    margin-top: 2rem;
-    border-radius: 8px;
-    transform: none;
-  }
-
-  .home-hero__visual::after {
-    background: linear-gradient(180deg, transparent 44%, rgb(21 17 13 / 0.28) 100%);
-  }
-
-  .home-hero h1 {
-    font-size: 3.4rem;
-  }
-
-  .home-afterfold {
-    padding: 1rem;
-  }
 }
 
 @media (max-width: 767px) {
@@ -225,59 +182,6 @@
   .agent-status-card > .history-icon-action {
     grid-column: 1 / -1;
     justify-self: end;
-  }
-
-  .home-hero {
-    padding: 2rem 0.85rem 1rem;
-  }
-
-  .home-kicker {
-    margin-bottom: 0.75rem;
-    font-size: 0.72rem;
-  }
-
-  .home-hero h1 {
-    font-size: 2.75rem;
-    line-height: 1.02;
-  }
-
-  .home-deck {
-    margin-top: 0.9rem;
-    font-size: 1rem;
-    line-height: 1.7;
-  }
-
-  .home-actions {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 0.65rem;
-    margin-top: 1.35rem;
-  }
-
-  .home-action {
-    width: 100%;
-    min-width: 0;
-  }
-
-  .home-provider-state {
-    width: 100%;
-    align-items: flex-start;
-  }
-
-  .home-hero__visual {
-    height: 16rem;
-    margin-top: 1.35rem;
-  }
-
-  .home-afterfold {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  .home-gallery-link {
-    width: 100%;
-    justify-content: center;
   }
 
   .api-setup-backdrop {

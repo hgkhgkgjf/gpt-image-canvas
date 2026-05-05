@@ -2107,7 +2107,7 @@ function showGenerationCompleteNotification(record: GenerationRecord, insertedCo
 
   new Notification(isPartial ? t("generationNotificationPartialTitle") : t("generationNotificationTitle"), {
     body,
-    icon: "/favicon.svg",
+    icon: "/favicon.png",
     tag: `generation-${record.id}`
   });
 }
@@ -2147,8 +2147,7 @@ function SaveStatusIcon({ status }: { status: SaveStatus }) {
 function BrandMark({ className = "" }: { className?: string }) {
   return (
     <span className={`brand-mark ${className}`} aria-hidden="true">
-      <span className="brand-mark__aperture" />
-      <span className="brand-mark__spark" />
+      <img className="brand-mark__image" src="/brand-logo.png" alt="" draggable={false} />
     </span>
   );
 }
