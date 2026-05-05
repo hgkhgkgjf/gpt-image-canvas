@@ -144,17 +144,47 @@
 }
 
 .provider-config-tabs {
+  --provider-tab-gap: 0.32rem;
+  --provider-tab-pad: 0.28rem;
+
+  position: relative;
+  isolation: isolate;
   display: grid;
   min-width: 0;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.32rem;
+  gap: var(--provider-tab-gap);
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--paper-soft);
-  padding: 0.28rem;
+  padding: var(--provider-tab-pad);
+}
+
+.provider-config-tabs::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: var(--provider-tab-pad);
+  bottom: var(--provider-tab-pad);
+  left: var(--provider-tab-pad);
+  width: calc((100% - (var(--provider-tab-pad) * 2) - var(--provider-tab-gap)) / 2);
+  border: 1px solid rgb(15 118 110 / 0.18);
+  border-radius: 7px;
+  background:
+    linear-gradient(180deg, rgb(15 118 110 / 0.1), transparent 100%),
+    var(--paper-panel);
+  box-shadow: inset 0 0 0 1px rgb(15 118 110 / 0.08);
+  pointer-events: none;
+  transform: translateX(0);
+  transition: transform var(--motion-duration-panel) var(--motion-ease-standard);
+}
+
+.provider-config-tabs[data-active-tab="agent"]::before {
+  transform: translateX(calc(100% + var(--provider-tab-gap)));
 }
 
 .provider-config-tab {
+  position: relative;
+  z-index: 1;
   display: grid;
   min-width: 0;
   min-height: 3.35rem;
@@ -169,11 +199,11 @@
   padding: 0.62rem 0.72rem;
   text-align: left;
   transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease,
-    transform 150ms ease;
+    border-color var(--motion-duration-control) var(--motion-ease-standard),
+    background-color var(--motion-duration-control) var(--motion-ease-standard),
+    color var(--motion-duration-control) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-control) var(--motion-ease-standard),
+    transform var(--motion-duration-control) var(--motion-ease-standard);
 }
 
 .provider-config-tab:hover {
@@ -184,12 +214,17 @@
 }
 
 .provider-config-tab[data-active="true"] {
-  border-color: rgb(15 118 110 / 0.18);
-  background:
-    linear-gradient(180deg, rgb(15 118 110 / 0.1), transparent 100%),
-    var(--paper-panel);
-  box-shadow: inset 0 0 0 1px rgb(15 118 110 / 0.08);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
   color: var(--focus);
+}
+
+.provider-config-tab[data-active="true"]:hover {
+  border-color: transparent;
+  background: transparent;
+  color: var(--focus);
+  transform: none;
 }
 
 .provider-config-tab:focus-visible {
@@ -235,6 +270,12 @@
 
 .provider-config-tab-panel--agent {
   align-items: start;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .provider-config-tabs::before {
+    transition: none;
+  }
 }
 
 .provider-overview-card {

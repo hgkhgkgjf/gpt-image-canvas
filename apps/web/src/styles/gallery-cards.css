@@ -466,6 +466,13 @@
   color: #9f1f15;
 }
 
+.gallery-icon-action[data-copied="true"],
+.gallery-copy-action[data-copied="true"] {
+  border-color: #bfe7df;
+  background: #effbf7;
+  color: #0f5f58;
+}
+
 .gallery-modal__close {
   flex: 0 0 auto;
   width: 2.4rem;

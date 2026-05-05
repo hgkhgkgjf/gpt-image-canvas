@@ -44,15 +44,44 @@
 }
 
 .panel-tab-switcher {
+  --panel-tab-gap: 0.3rem;
+  --panel-tab-pad-x: 0.65rem;
+  --panel-tab-pad-y: 0.45rem;
+
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.3rem;
+  gap: var(--panel-tab-gap);
   border-bottom: 1px solid var(--line);
   background: #f7efe4;
-  padding: 0.45rem 0.65rem;
+  padding: var(--panel-tab-pad-y) var(--panel-tab-pad-x);
+}
+
+.panel-tab-switcher::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: var(--panel-tab-pad-y);
+  bottom: var(--panel-tab-pad-y);
+  left: var(--panel-tab-pad-x);
+  width: calc((100% - (var(--panel-tab-pad-x) * 2) - var(--panel-tab-gap)) / 2);
+  border: 1px solid var(--accent-dark);
+  border-radius: 7px;
+  background: #fffdf8;
+  box-shadow: 0 8px 18px rgb(126 50 26 / 0.12);
+  pointer-events: none;
+  transform: translateX(0);
+  transition: transform var(--motion-duration-panel) var(--motion-ease-standard);
+}
+
+.panel-tab-switcher[data-active-tab="agent"]::before {
+  transform: translateX(calc(100% + var(--panel-tab-gap)));
 }
 
 .panel-tab-switcher__button {
+  position: relative;
+  z-index: 1;
   display: inline-flex;
   min-width: 0;
   min-height: 2.25rem;
@@ -69,10 +98,10 @@
   line-height: 1;
   padding: 0 0.75rem;
   transition:
-    border-color 150ms ease,
-    background-color 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease;
+    border-color var(--motion-duration-control) var(--motion-ease-standard),
+    background-color var(--motion-duration-control) var(--motion-ease-standard),
+    color var(--motion-duration-control) var(--motion-ease-standard),
+    box-shadow var(--motion-duration-control) var(--motion-ease-standard);
 }
 
 .panel-tab-switcher__button:hover {
@@ -82,8 +111,20 @@
 }
 
 .panel-tab-switcher__button.is-active {
-  border-color: var(--accent-dark);
-  background: #fffdf8;
-  box-shadow: 0 8px 18px rgb(126 50 26 / 0.12);
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
   color: var(--accent-dark);
+}
+
+.panel-tab-switcher__button.is-active:hover {
+  border-color: transparent;
+  background: transparent;
+  color: var(--accent-dark);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-tab-switcher::before {
+    transition: none;
+  }
 }

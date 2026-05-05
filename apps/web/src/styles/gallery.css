@@ -392,10 +392,10 @@
   background: #ffffff;
   color: #475569;
   transition:
-    background-color 150ms ease,
-    border-color 150ms ease,
-    color 150ms ease,
-    transform 150ms ease;
+    background-color var(--motion-duration-control) var(--motion-ease-standard),
+    border-color var(--motion-duration-control) var(--motion-ease-standard),
+    color var(--motion-duration-control) var(--motion-ease-standard),
+    transform var(--motion-duration-control) var(--motion-ease-standard);
 }
 
 .gallery-icon-action:hover {
@@ -427,6 +427,55 @@
   color: #991b1b;
 }
 
+.gallery-icon-action__icon-stack {
+  display: inline-grid;
+  width: 1rem;
+  height: 1rem;
+  flex: none;
+  place-items: center;
+}
+
+.gallery-icon-action__icon {
+  grid-area: 1 / 1;
+  transition:
+    opacity var(--motion-duration-swap) var(--motion-ease-standard),
+    filter var(--motion-duration-swap) var(--motion-ease-standard),
+    transform var(--motion-duration-swap) var(--motion-ease-standard);
+}
+
+.gallery-icon-action__icon--copy {
+  opacity: 1;
+  filter: blur(0);
+  transform: scale(1);
+}
+
+.gallery-icon-action__icon--check {
+  opacity: 0;
+  filter: blur(var(--motion-blur-swap));
+  transform: scale(var(--motion-scale-icon-start));
+}
+
+.gallery-icon-action[data-copied="true"],
+.gallery-copy-action[data-copied="true"] {
+  border-color: #99f6e4;
+  background: #ecfdf5;
+  color: #0f766e;
+}
+
+.gallery-icon-action[data-copied="true"] .gallery-icon-action__icon--copy,
+.gallery-copy-action[data-copied="true"] .gallery-icon-action__icon--copy {
+  opacity: 0;
+  filter: blur(var(--motion-blur-swap));
+  transform: scale(var(--motion-scale-icon-start));
+}
+
+.gallery-icon-action[data-copied="true"] .gallery-icon-action__icon--check,
+.gallery-copy-action[data-copied="true"] .gallery-icon-action__icon--check {
+  opacity: 1;
+  filter: blur(0);
+  transform: scale(1);
+}
+
 .gallery-modal-backdrop {
   position: fixed;
   z-index: 3100;
@@ -436,6 +485,12 @@
   justify-content: center;
   background: rgb(15 23 42 / 0.68);
   padding: 1rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gallery-icon-action__icon {
+    transition: none;
+  }
 }
 
 .gallery-modal {

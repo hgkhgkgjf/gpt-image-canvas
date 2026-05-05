@@ -2,6 +2,7 @@ import {
   AlertTriangle,
   Bot,
   BrainCircuit,
+  Check,
   CheckCircle2,
   ChevronDown,
   CircleStop,
@@ -5004,7 +5005,13 @@ export function App() {
           </div>
         </div>
 
-        <div className="panel-tab-switcher" data-testid="right-panel-tab-switcher" role="tablist" aria-label={t("panelTabAria")}>
+        <div
+          className="panel-tab-switcher"
+          data-active-tab={panelTab}
+          data-testid="right-panel-tab-switcher"
+          role="tablist"
+          aria-label={t("panelTabAria")}
+        >
           <button
             aria-selected={panelTab === "manual"}
             className={panelTab === "manual" ? "panel-tab-switcher__button is-active" : "panel-tab-switcher__button"}
@@ -5030,7 +5037,7 @@ export function App() {
 
         {panelTab === "manual" ? (
         <>
-        <div className="ai-panel-body flex-1 space-y-5 overflow-y-auto px-5 py-5">
+        <div className="ai-panel-body ai-panel-tab-panel ai-panel-tab-panel--body flex-1 space-y-5 overflow-y-auto px-5 py-5" data-tab="manual">
           {saveError ? (
             <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700" data-testid="save-error">
               {saveError}
@@ -5467,7 +5474,7 @@ export function App() {
           </section>
         </div>
 
-        <div className="ai-panel-actions grid grid-cols-1 gap-3 border-t border-neutral-200 bg-white px-5 py-4">
+        <div className="ai-panel-actions ai-panel-tab-panel ai-panel-tab-panel--actions grid grid-cols-1 gap-3 border-t border-neutral-200 bg-white px-5 py-4" data-tab="manual">
           {panelStatus ? (
             <div
               aria-live={panelStatus.tone === "progress" ? "polite" : "assertive"}
@@ -5499,7 +5506,7 @@ export function App() {
         </>
         ) : (
         <>
-        <div className="ai-panel-body agent-panel-body flex-1 px-5 py-4" data-testid="agent-tab-panel">
+        <div className="ai-panel-body ai-panel-tab-panel ai-panel-tab-panel--body agent-panel-body flex-1 px-5 py-4" data-tab="agent" data-testid="agent-tab-panel">
           {saveError ? (
             <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700" data-testid="save-error">
               {saveError}
@@ -5603,7 +5610,10 @@ export function App() {
                               type="button"
                               onClick={() => void copyAgentMessage(message)}
                             >
-                              <Copy className="size-3.5" aria-hidden="true" />
+                              <span className="agent-message-copy-button__icon-stack" aria-hidden="true">
+                                <Copy className="agent-message-copy-button__icon agent-message-copy-button__icon--copy size-3.5" />
+                                <Check className="agent-message-copy-button__icon agent-message-copy-button__icon--check size-3.5" />
+                              </span>
                             </button>
                           ) : null}
                         </span>
@@ -5668,7 +5678,7 @@ export function App() {
           </section>
         </div>
 
-        <div className="ai-panel-actions agent-panel-actions agent-composer-shell border-t border-neutral-200 bg-white px-5 py-4">
+        <div className="ai-panel-actions ai-panel-tab-panel ai-panel-tab-panel--actions agent-panel-actions agent-composer-shell border-t border-neutral-200 bg-white px-5 py-4" data-tab="agent">
           <div className="agent-param-bar">
             <div className="agent-param-group">
               <button
@@ -5934,11 +5944,11 @@ export function App() {
       </aside>
 
       {isStorageDialogOpen ? (
-        <div className="fixed inset-0 z-[3000] flex items-center justify-center bg-neutral-950/45 px-4 py-6" data-testid="storage-dialog">
+        <div className="app-modal-backdrop fixed inset-0 z-[3000] flex items-center justify-center bg-neutral-950/45 px-4 py-6" data-testid="storage-dialog">
           <div
             aria-labelledby="storage-dialog-title"
             aria-modal="true"
-            className="flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-lg border border-neutral-200 bg-white shadow-2xl"
+            className="app-modal-surface flex max-h-full w-full max-w-lg flex-col overflow-hidden rounded-lg border border-neutral-200 bg-white shadow-2xl"
             role="dialog"
           >
             <div className="flex items-start justify-between gap-3 border-b border-neutral-200 px-5 py-4">
@@ -6077,11 +6087,11 @@ export function App() {
 
       {isCodexLoginOpen ? createPortal(
         (
-        <div className="fixed inset-0 z-[3000] flex items-center justify-center bg-neutral-950/45 px-4 py-6" data-testid="codex-login-dialog">
+        <div className="app-modal-backdrop fixed inset-0 z-[3000] flex items-center justify-center bg-neutral-950/45 px-4 py-6" data-testid="codex-login-dialog">
           <div
             aria-labelledby="codex-login-title"
             aria-modal="true"
-            className="codex-login-dialog"
+            className="codex-login-dialog app-modal-surface"
             role="dialog"
           >
             <div className="codex-login-dialog__header">

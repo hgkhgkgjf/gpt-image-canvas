@@ -458,11 +458,11 @@ export function ProviderConfigDialog({
   }
 
   const dialog = (
-    <div className="provider-config-backdrop" data-testid="provider-config-dialog" role="presentation" onClick={onClose}>
+    <div className="provider-config-backdrop app-modal-backdrop" data-testid="provider-config-dialog" role="presentation" onClick={onClose}>
       <div
         aria-labelledby="provider-config-title"
         aria-modal="true"
-        className="provider-config-dialog"
+        className="provider-config-dialog app-modal-surface"
         role="dialog"
         onClick={(event) => event.stopPropagation()}
       >
@@ -491,7 +491,13 @@ export function ProviderConfigDialog({
             </div>
           ) : null}
 
-          <nav className="provider-config-tabs" aria-label={t("providerConfigTabsLabel")} data-testid="provider-config-tabs" role="tablist">
+          <nav
+            className="provider-config-tabs"
+            aria-label={t("providerConfigTabsLabel")}
+            data-active-tab={activeTab}
+            data-testid="provider-config-tabs"
+            role="tablist"
+          >
             <button
               aria-controls="provider-config-panel-image"
               aria-selected={activeTab === "image"}
@@ -534,8 +540,10 @@ export function ProviderConfigDialog({
             <div
               aria-labelledby="provider-config-tab-image"
               className="provider-config-tab-panel"
+              data-tab="image"
               data-testid="provider-image-panel"
               id="provider-config-panel-image"
+              key="image"
               role="tabpanel"
             >
               <section className="provider-overview-card" data-mode="image">
@@ -747,8 +755,10 @@ export function ProviderConfigDialog({
             <div
               aria-labelledby="provider-config-tab-agent"
               className="provider-config-tab-panel provider-config-tab-panel--agent"
+              data-tab="agent"
               data-testid="provider-agent-panel"
               id="provider-config-panel-agent"
+              key="agent"
               role="tabpanel"
             >
               <div className="provider-workspace provider-workspace--agent">

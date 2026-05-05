@@ -6,6 +6,8 @@ node_modules/
 .ralph/
 data/
 generated/
+!docs/generated/
+!docs/generated/**
 generated-assets/
 assets/generated/
 *.db

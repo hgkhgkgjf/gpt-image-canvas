@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  CheckCircle2,
   ChevronDown,
   Clock3,
   Copy,
@@ -49,7 +50,9 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   const [selectedItem, setSelectedItem] = useState<GalleryImageItem | null>(null);
   const [pendingDeleteItem, setPendingDeleteItem] = useState<GalleryImageItem | null>(null);
   const [deletingOutputId, setDeletingOutputId] = useState<string | null>(null);
+  const [copiedOutputId, setCopiedOutputId] = useState<string | null>(null);
   const statusTimerRef = useRef<number | undefined>();
+  const copiedTimerRef = useRef<number | undefined>();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -120,6 +123,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   useEffect(() => {
     return () => {
       window.clearTimeout(statusTimerRef.current);
+      window.clearTimeout(copiedTimerRef.current);
     };
   }, []);
 
@@ -159,6 +163,12 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
   async function copyPrompt(item: GalleryImageItem): Promise<void> {
     try {
       await writeClipboardText(item.prompt);
+      window.clearTimeout(copiedTimerRef.current);
+      setCopiedOutputId(item.outputId);
+      copiedTimerRef.current = window.setTimeout(() => {
+        setCopiedOutputId((current) => (current === item.outputId ? null : current));
+        copiedTimerRef.current = undefined;
+      }, 1800);
       showStatus(t("galleryCopiedPrompt"));
     } catch {
       setError(t("generationCopyFailed"));
@@ -189,6 +199,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
       setItems((current) => current.filter((galleryItem) => galleryItem.outputId !== item.outputId));
       setSelectedItem((current) => (current?.outputId === item.outputId ? null : current));
+      setCopiedOutputId((current) => (current === item.outputId ? null : current));
       setPendingDeleteItem(null);
       onDeleted(item.outputId);
       showStatus(t("galleryDeleted"));
@@ -260,6 +271,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
           <>
             {featuredItem ? (
               <FeaturedGalleryItem
+                copied={copiedOutputId === featuredItem.outputId}
                 deleting={deletingOutputId === featuredItem.outputId}
                 expanded={Boolean(expandedPrompts[featuredItem.outputId])}
                 item={featuredItem}
@@ -273,6 +285,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
               <div className="gallery-grid" data-testid="gallery-grid">
                 {gridItems.map((item) => (
                   <GalleryCard
+                    copied={copiedOutputId === item.outputId}
                     deleting={deletingOutputId === item.outputId}
                     expanded={Boolean(expandedPrompts[item.outputId])}
                     item={item}
@@ -290,6 +303,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 
       {selectedItem ? (
         <GalleryDetailDialog
+          copied={copiedOutputId === selectedItem.outputId}
           deleting={deletingOutputId === selectedItem.outputId}
           item={selectedItem}
           onClose={() => setSelectedItem(null)}
@@ -313,6 +327,7 @@ export function GalleryPage({ onDeleted, onReuse }: GalleryPageProps) {
 }
 
 function FeaturedGalleryItem({
+  copied,
   deleting,
   expanded,
   item,
@@ -323,6 +338,7 @@ function FeaturedGalleryItem({
   onReuse,
   onTogglePrompt
 }: {
+  copied: boolean;
   deleting: boolean;
   expanded: boolean;
   item: GalleryImageItem;
@@ -373,6 +389,7 @@ function FeaturedGalleryItem({
             <span>{t("qualityLabel", { quality: item.quality })}</span>
           </div>
           <GalleryIconActions
+            copied={copied}
             deleting={deleting}
             item={item}
             onCopy={onCopy}
@@ -387,6 +404,7 @@ function FeaturedGalleryItem({
 }
 
 function GalleryCard({
+  copied,
   deleting,
   expanded,
   item,
@@ -397,6 +415,7 @@ function GalleryCard({
   onReuse,
   onTogglePrompt
 }: {
+  copied: boolean;
   deleting: boolean;
   expanded: boolean;
   item: GalleryImageItem;
@@ -441,6 +460,7 @@ function GalleryCard({
             {formatCreatedTime(item.createdAt, formatDateTime)}
           </span>
           <GalleryIconActions
+            copied={copied}
             deleting={deleting}
             item={item}
             onCopy={onCopy}
@@ -455,6 +475,7 @@ function GalleryCard({
 }
 
 function GalleryIconActions({
+  copied,
   deleting,
   item,
   onCopy,
@@ -462,6 +483,7 @@ function GalleryIconActions({
   onDownload,
   onReuse
 }: {
+  copied: boolean;
   deleting: boolean;
   item: GalleryImageItem;
 } & GalleryActionHandlers) {
@@ -471,13 +493,17 @@ function GalleryIconActions({
   return (
     <div className="gallery-card__actions">
       <button
-        aria-label={t("galleryActionCopyPrompt", { excerpt })}
+        aria-label={copied ? t("galleryCopiedPrompt") : t("galleryActionCopyPrompt", { excerpt })}
         className="gallery-icon-action"
-        title={t("galleryPromptLabel")}
+        data-copied={copied}
+        title={copied ? t("galleryCopiedPrompt") : t("galleryPromptLabel")}
         type="button"
         onClick={() => onCopy(item)}
       >
-        <Copy className="size-4" aria-hidden="true" />
+        <span className="gallery-icon-action__icon-stack" aria-hidden="true">
+          <Copy className="gallery-icon-action__icon gallery-icon-action__icon--copy size-4" />
+          <CheckCircle2 className="gallery-icon-action__icon gallery-icon-action__icon--check size-4" />
+        </span>
       </button>
       <button
         aria-label={t("galleryActionDownloadImage", { excerpt })}
@@ -571,6 +597,7 @@ function CollapsiblePrompt({
 }
 
 function GalleryDetailDialog({
+  copied,
   deleting,
   item,
   onClose,
@@ -579,6 +606,7 @@ function GalleryDetailDialog({
   onDownload,
   onReuse
 }: {
+  copied: boolean;
   deleting: boolean;
   item: GalleryImageItem;
   onClose: () => void;
@@ -591,8 +619,8 @@ function GalleryDetailDialog({
   const { formatDateTime, t } = useI18n();
 
   return (
-    <div className="gallery-modal-backdrop" data-testid="gallery-detail" role="presentation">
-      <div aria-labelledby="gallery-detail-title" aria-modal="true" className="gallery-modal" role="dialog">
+    <div className="gallery-modal-backdrop app-modal-backdrop" data-testid="gallery-detail" role="presentation">
+      <div aria-labelledby="gallery-detail-title" aria-modal="true" className="gallery-modal app-modal-surface" role="dialog">
         <header className="gallery-modal__header">
           <div className="gallery-modal__title">
             <p>{t("galleryDetailEyebrow")}</p>
@@ -635,8 +663,18 @@ function GalleryDetailDialog({
         </div>
 
         <footer className="gallery-modal__actions">
-          <button className="secondary-action h-10" type="button" onClick={onCopy}>
-            <Copy className="size-4" aria-hidden="true" />
+          <button
+            aria-label={copied ? t("galleryCopiedPrompt") : t("commonCopy")}
+            className="secondary-action gallery-copy-action h-10"
+            data-copied={copied}
+            title={copied ? t("galleryCopiedPrompt") : t("commonCopy")}
+            type="button"
+            onClick={onCopy}
+          >
+            <span className="gallery-icon-action__icon-stack" aria-hidden="true">
+              <Copy className="gallery-icon-action__icon gallery-icon-action__icon--copy size-4" />
+              <CheckCircle2 className="gallery-icon-action__icon gallery-icon-action__icon--check size-4" />
+            </span>
             {t("commonCopy")}
           </button>
           <button className="secondary-action h-10" type="button" onClick={onDownload}>
@@ -671,12 +709,12 @@ function DeleteGalleryDialog({
   const { t } = useI18n();
 
   return (
-    <div className="gallery-confirm-backdrop" data-testid="gallery-delete-dialog" role="presentation">
+    <div className="gallery-confirm-backdrop app-modal-backdrop" data-testid="gallery-delete-dialog" role="presentation">
       <div
         aria-describedby="gallery-delete-description"
         aria-labelledby="gallery-delete-title"
         aria-modal="true"
-        className="gallery-confirm"
+        className="gallery-confirm app-modal-surface"
         role="dialog"
       >
         <div className="gallery-confirm__icon">
