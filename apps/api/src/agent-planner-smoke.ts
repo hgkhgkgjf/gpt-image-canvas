@@ -67,6 +67,10 @@ async function main(): Promise<void> {
   await smokeDirectPlannerInvalidJson();
   await smokeDirectPlannerTransportError();
   smokeModelJobSizeCoercion();
+  smokeModelArbitraryFinalJobCount();
+  smokeModelArbitraryDefaultCount();
+  smokeModelArbitraryDependentTargetCount();
+  smokeModelUnsupportedSourceJobCountRejection();
   smokeModelOptionalOutputAliases();
   smokeModelReferenceAliases();
 
@@ -816,6 +820,124 @@ function smokeModelJobSizeCoercion(): void {
   );
   expectOk(nullSizeResult, "null job size falls back to defaults");
   expect(nullSizeResult.plan.jobs[0]?.size === undefined, "null job size is omitted from the parsed job");
+}
+
+function smokeModelArbitraryFinalJobCount(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          id: "travel_vlog_batch",
+          prompt: "Create nine realistic travel vlog stills.",
+          count: 9
+        })
+      ]
+    }),
+    []
+  );
+
+  expectOk(result, "arbitrary final job count is accepted");
+  expect(result.plan.jobs.length === 1, "count 9 remains one coherent job");
+  expect(result.plan.jobs[0]?.id === "travel_vlog_batch", "arbitrary-count job keeps original id");
+  expect(result.plan.jobs[0]?.count === 9, "arbitrary-count job preserves requested count");
+}
+
+function smokeModelArbitraryDefaultCount(): void {
+  const result = validate(
+    planFixture({
+      defaults: {
+        ...defaults,
+        count: 9
+      },
+      jobs: [
+        jobFixture({
+          id: "default_count_batch",
+          prompt: "Create nine images using the plan default count.",
+          count: undefined
+        })
+      ]
+    }),
+    []
+  );
+
+  expectOk(result, "arbitrary default count is accepted");
+  expect(result.plan.defaults.count === 9, "arbitrary default count is preserved");
+  expect(result.plan.jobs.length === 1, "default count 9 remains one coherent job");
+  expect(result.plan.jobs[0]?.count === 9, "job inherits arbitrary default count");
+}
+
+function smokeModelArbitraryDependentTargetCount(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          id: "style_anchor",
+          role: "style_anchor",
+          prompt: "Create one visible documentary style anchor.",
+          count: 1
+        }),
+        jobFixture({
+          id: "final_batch",
+          prompt: "Create three final images using the style anchor.",
+          count: 3,
+          references: [
+            {
+              kind: "generated_output",
+              usage: "style",
+              jobId: "style_anchor"
+            }
+          ]
+        })
+      ],
+      edges: [
+        {
+          fromJobId: "style_anchor",
+          toJobId: "final_batch"
+        }
+      ]
+    }),
+    []
+  );
+
+  expectOk(result, "arbitrary dependent target count is accepted");
+  expect(result.plan.jobs.length === 2, "dependent target count 3 remains one coherent job plus anchor");
+  expect(result.plan.jobs[1]?.count === 3, "dependent target preserves requested count");
+  expect(result.plan.edges.length === 1, "incoming dependency edge stays attached to the coherent target job");
+}
+
+function smokeModelUnsupportedSourceJobCountRejection(): void {
+  const result = validate(
+    planFixture({
+      jobs: [
+        jobFixture({
+          id: "multi_anchor",
+          role: "style_anchor",
+          prompt: "Create three style anchors.",
+          count: 3
+        }),
+        jobFixture({
+          id: "final_image",
+          references: [
+            {
+              kind: "generated_output",
+              usage: "style",
+              jobId: "multi_anchor"
+            }
+          ]
+        })
+      ],
+      edges: [
+        {
+          fromJobId: "multi_anchor",
+          toJobId: "final_image"
+        }
+      ]
+    }),
+    []
+  );
+
+  expect(!result.ok, "unsupported source job count is still rejected");
+  expect(result.code === "invalid_dependency_source_count", "multi-output source count keeps the dependency validation code");
 }
 
 function smokeModelOptionalOutputAliases(): void {

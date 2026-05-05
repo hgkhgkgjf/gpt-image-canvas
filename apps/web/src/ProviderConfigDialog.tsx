@@ -117,8 +117,6 @@ export function ProviderConfigDialog({
   const availableSourceCount = sourceOrder.filter((sourceId) => sourcesById.get(sourceId)?.available).length;
   const activeSourceRank = activeSourceId ? sourceOrder.indexOf(activeSourceId) + 1 : 0;
   const activeSourceTimeout = activeSource?.details.timeoutMs;
-  const agentTimeoutSummary = parsePositiveInteger(agentForm.timeoutMs);
-  const agentOverviewCopy = agentConfig?.configured ? agentForm.baseUrl.trim() || t("providerApiOfficial") : t("providerCurrentNone");
 
   const loadProviderConfig = useCallback(
     async (signal?: AbortSignal): Promise<ProviderConfigResponse | null> => {
@@ -753,26 +751,6 @@ export function ProviderConfigDialog({
               id="provider-config-panel-agent"
               role="tabpanel"
             >
-              <section className="provider-overview-card" data-mode="agent">
-                <div className="provider-overview-card__copy">
-                  <span className="provider-overview-card__eyebrow">{t("agentLlmTitle")}</span>
-                  <div className="provider-overview-card__headline">
-                    <span className="provider-overview-card__icon">
-                      <Bot className="size-5" aria-hidden="true" />
-                    </span>
-                    <div className="min-w-0">
-                      <h3>{agentForm.model.trim() || t("agentLlmTitle")}</h3>
-                      <p>{agentOverviewCopy}</p>
-                    </div>
-                  </div>
-                </div>
-                <div className="provider-overview-metrics">
-                  <ProviderMetric label={t("providerFieldAvailability")} value={agentConfig?.configured ? "1/1" : "0/1"} />
-                  <ProviderMetric label={t("providerFieldModel")} value={agentForm.model.trim() || t("commonNotSet")} />
-                  <ProviderMetric label={t("providerFieldTimeout")} value={formatTimeout(agentTimeoutSummary, t)} />
-                </div>
-              </section>
-
               <div className="provider-workspace provider-workspace--agent">
                 <section className="provider-detail-card provider-detail-card--agent" data-testid="provider-agent-section" aria-labelledby="provider-agent-title">
                   <header className="provider-detail-card__header">
@@ -781,7 +759,7 @@ export function ProviderConfigDialog({
                     </span>
                     <div className="min-w-0">
                       <h3 id="provider-agent-title">{t("agentLlmTitle")}</h3>
-                      <p>{agentOverviewCopy}</p>
+                      <p>{t("agentLlmDescription")}</p>
                     </div>
                     <ProviderAvailabilityBadge available={agentConfig?.configured ?? false} />
                   </header>
@@ -1020,11 +998,6 @@ function formatOptionalDateTime(value: string | undefined, formatDateTime: (valu
   }
 
   return formatDateTime(value);
-}
-
-function parsePositiveInteger(value: string): number | undefined {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function providerOverviewCopy(sourceId: ProviderSourceId | undefined, t: Translate): string {

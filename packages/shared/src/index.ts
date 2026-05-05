@@ -272,7 +272,7 @@ export interface GenerationPlanDefaults {
   size: ImageSize;
   quality: ImageQuality;
   outputFormat: OutputFormat;
-  count?: GenerationCount;
+  count?: number;
   stylePresetId?: StylePresetId;
 }
 

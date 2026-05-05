@@ -4,7 +4,6 @@ import { createDeepAgent } from "deepagents";
 import type { UsableAgentLlmConfig } from "./agent-config.js";
 import { CANVAS_IMAGE_PLANNING_SKILL, createPlanningSkillFiles, createPlanningSystemPrompt } from "./agent-planning-skill.js";
 import {
-  GENERATION_COUNTS,
   GENERATION_PLAN_SCHEMA_VERSION,
   IMAGE_QUALITIES,
   MAX_AGENT_SELECTED_REFERENCES,
@@ -18,7 +17,6 @@ import {
   type AgentReasoningEffort,
   type AgentSelectedCanvasReference,
   type AgentThinkingType,
-  type GenerationCount,
   type GenerationDependencyEdge,
   type GenerationJob,
   type GenerationJobRole,
@@ -40,7 +38,7 @@ import {
 const DEFAULT_PLAN_SIZE: ImageSize = { width: 1024, height: 1024 };
 const DEFAULT_PLAN_QUALITY: ImageQuality = "auto";
 const DEFAULT_PLAN_OUTPUT_FORMAT: OutputFormat = "png";
-const DEFAULT_PLAN_COUNT: GenerationCount = 1;
+const DEFAULT_PLAN_COUNT = 1;
 
 const GENERATION_JOB_ROLES: readonly GenerationJobRole[] = [
   "final_image",
@@ -1165,7 +1163,9 @@ function parsePlanDefaultsFromPlan(
 
   const count = parseGenerationCount(input.count);
   if (input.count !== undefined && !count) {
-    issues.push(issue("invalid_plan_defaults", "Plan default count is unsupported.", "defaults.count"));
+    issues.push(
+      issue("invalid_plan_defaults", `Plan default count must be an integer from 1 to ${MAX_GENERATION_PLAN_IMAGES}.`, "defaults.count")
+    );
   }
 
   const stylePresetId = parseStylePresetId(input.stylePresetId);
@@ -1225,7 +1225,9 @@ function parsePlanJobs(
 
     const count = parseGenerationCount(rawJob.count ?? defaults.count);
     if (!count) {
-      issues.push(issue("invalid_plan_job", "GenerationJob count must be one of 1, 2, 4, 8, or 16.", `${path}.count`));
+      issues.push(
+        issue("invalid_plan_job", `GenerationJob count must be an integer from 1 to ${MAX_GENERATION_PLAN_IMAGES}.`, `${path}.count`)
+      );
     }
 
     const status = rawJob.status === undefined ? "queued" : parseJobStatus(rawJob.status);
@@ -1792,9 +1794,9 @@ function parseOutputFormat(value: unknown): OutputFormat | undefined {
   return OUTPUT_FORMATS.includes(outputFormat as OutputFormat) ? (outputFormat as OutputFormat) : undefined;
 }
 
-function parseGenerationCount(value: unknown): GenerationCount | undefined {
+function parseGenerationCount(value: unknown): number | undefined {
   const count = positiveIntegerValue(value);
-  return count && GENERATION_COUNTS.includes(count as GenerationCount) ? (count as GenerationCount) : undefined;
+  return count && count <= MAX_GENERATION_PLAN_IMAGES ? count : undefined;
 }
 
 function normalizedOptionToken(value: unknown): string | undefined {

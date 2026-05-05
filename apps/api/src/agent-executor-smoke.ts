@@ -17,7 +17,7 @@ const tinyPngBase64 =
 
 async function main(): Promise<void> {
   try {
-    const [{ executeGenerationPlan }, { closeDatabase }] = await Promise.all([
+    const [{ executeGenerationPlan, isExecutableGenerationPlan }, { closeDatabase }] = await Promise.all([
       import("./agent-executor.js"),
       import("./database.js")
     ]);
@@ -112,6 +112,24 @@ async function main(): Promise<void> {
       expect(multiSelectedRun.status === "succeeded", "multiple independent selected-reference jobs succeed");
       expect(multiSelectedProvider.generateCalls === 0, "multiple selected-reference jobs do not call text generation");
       expect(multiSelectedProvider.editCalls === 2, "multiple selected-reference jobs each use edit generation");
+
+      const arbitraryCountProvider = new FakeImageProvider();
+      const arbitraryCountPlan = arbitraryCountPlanFixture();
+      expect(isExecutableGenerationPlan(arbitraryCountPlan), "single agent job can request an arbitrary count up to the plan cap");
+      const arbitraryCountRun = await executeGenerationPlan({
+        plan: arbitraryCountPlan,
+        selectedReferences: [],
+        mode: "execute",
+        provider: arbitraryCountProvider,
+        requestId: "smoke-arbitrary-count",
+        runId: "run-arbitrary-count",
+        signal: new AbortController().signal,
+        isRunActive: () => true,
+        sendEvent: () => undefined
+      });
+      expect(arbitraryCountRun.status === "succeeded", "arbitrary-count agent job succeeds");
+      expect(arbitraryCountProvider.generateCalls === 9, "arbitrary-count agent job is fanned out by the generation runner");
+      expect(arbitraryCountRun.plan.jobs[0]?.outputs.length === 9, "arbitrary-count agent job preserves all outputs on one job");
 
       const retryProvider = new FakeImageProvider();
       const retryPlan = clonePlan(success.plan);
@@ -337,6 +355,41 @@ function multiSelectedReferencePlanFixture(): GenerationPlan {
             assetId: "local-only-reference-2"
           }
         ],
+        status: "queued",
+        outputs: [],
+        visible: true
+      }
+    ],
+    edges: [],
+    createdBy: "agent",
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+function arbitraryCountPlanFixture(): GenerationPlan {
+  const now = "2026-01-01T00:00:00.000Z";
+  return {
+    schemaVersion: 1,
+    id: "plan-arbitrary-count-smoke",
+    title: "Arbitrary count smoke plan",
+    status: "awaiting_confirmation",
+    defaults: {
+      size: {
+        width: 1024,
+        height: 1024
+      },
+      quality: "auto",
+      outputFormat: "png",
+      count: 1
+    },
+    jobs: [
+      {
+        id: "travel_vlog_batch",
+        role: "final_image",
+        prompt: "Create nine realistic travel vlog stills.",
+        count: 9,
+        references: [],
         status: "queued",
         outputs: [],
         visible: true

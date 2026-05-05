@@ -28,7 +28,7 @@ Each GenerationJob must include:
 - id: stable snake_case id unique within the plan
 - role: "final_image", "variation", "character_anchor", "style_anchor", or "reference_anchor"
 - prompt: complete image prompt
-- count: requested generated image count for this job
+- count: requested generated image count for this job. Must be an integer from 1 to 16.
 - size, quality, and outputFormat only when overriding defaults. quality must be "auto", "low", "medium", or "high"; outputFormat must be "png", "jpeg", or "webp".
 - references: array of selected_canvas_image or generated_output references
 - status: "queued"
@@ -44,6 +44,7 @@ If missing user input makes a safe plan impossible, return an AgentUserQuestion 
 Core rules:
 1. The plan only describes work. Never claim execution has started or completed. The user must confirm before execution.
 2. Sum every job.count, including character/style/reference anchors and final images. The total must be 16 or less.
+2a. A single coherent job may request any count from 1 to 16, such as count 3, 5, or 9. Do not split a job only because of provider batch sizes.
 3. Each job may use at most 3 resolved reference images. The request context may list up to 16 selected canvas references for batch work; split batch edits into separate jobs instead of placing more than 3 references on one job.
 4. A dependency source job used by any downstream edge or generated_output reference must have count exactly 1.
 5. Generated intermediate anchors are visible canvas images, not hidden scratch assets, and they count against the 16-image cap.

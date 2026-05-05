@@ -1,6 +1,5 @@
 import {
   composePrompt,
-  GENERATION_COUNTS,
   MAX_GENERATION_JOB_REFERENCES,
   MAX_GENERATION_PLAN_IMAGES,
   sizeToApiValue,
@@ -635,8 +634,7 @@ function isExecutableGenerationJob(value: unknown): value is GenerationJob {
   return (
     typeof value.id === "string" &&
     typeof value.prompt === "string" &&
-    typeof value.count === "number" &&
-    GENERATION_COUNTS.includes(value.count as (typeof GENERATION_COUNTS)[number]) &&
+    isExecutableGenerationCount(value.count) &&
     isJobRole(value.role) &&
     isJobStatus(value.status) &&
     (value.size === undefined || isImageSize(value.size)) &&
@@ -648,6 +646,10 @@ function isExecutableGenerationJob(value: unknown): value is GenerationJob {
     typeof value.visible === "boolean" &&
     (value.error === undefined || typeof value.error === "string")
   );
+}
+
+function isExecutableGenerationCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= MAX_GENERATION_PLAN_IMAGES;
 }
 
 function executionPlanWithinBounds(jobs: GenerationJob[], edges: Array<{ fromJobId: string; toJobId: string }>): boolean {
