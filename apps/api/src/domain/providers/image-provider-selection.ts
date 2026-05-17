@@ -2,7 +2,8 @@ import { getCodexResponsesBaseURL, getValidCodexSession } from "./codex-auth.js"
 import type { CodexAccessSession } from "./codex-auth.js";
 import {
   createCodexImageProvider,
-  getCodexImageProviderTimeoutMs
+  getCodexImageProviderTimeoutMs,
+  getCodexResponsesModel
 } from "../../infrastructure/providers/codex-image-provider.js";
 import {
   ProviderError,
@@ -35,7 +36,8 @@ export async function createConfiguredImageProvider(signal?: AbortSignal): Promi
   if (selection?.provider === "codex" && selection.codexSession) {
     return createCodexImageProvider({
       baseURL: getCodexResponsesBaseURL(),
-      model: getConfiguredImageModel(),
+      responsesModel: getCodexResponsesModel(),
+      imageModel: getConfiguredImageModel(),
       timeoutMs: getCodexImageProviderTimeoutMs(),
       getSession: async (requestSignal?: AbortSignal) => selection.codexSession ?? getValidCodexSession(requestSignal)
     });

@@ -73,9 +73,11 @@ OPENAI_API_KEY=
 OPENAI_BASE_URL=
 OPENAI_IMAGE_MODEL=gpt-image-2
 OPENAI_IMAGE_TIMEOUT_MS=1200000
+CODEX_RESPONSES_MODEL=gpt-5.5
 ```
 
 Leave `OPENAI_BASE_URL` empty for the official OpenAI API. Set it to an OpenAI-compatible `/v1` endpoint when using another provider, and set `OPENAI_IMAGE_MODEL` if that endpoint expects a different image model name.
+When using Codex login, `CODEX_RESPONSES_MODEL` controls the mainline Responses model for the ChatGPT OAuth bridge; `OPENAI_IMAGE_MODEL` remains the image-generation tool model.
 
 You can also open the top-right `配置` dialog and save one local OpenAI-compatible provider. Local keys are stored in SQLite under `DATA_DIR`, returned only as masked values, and preserved until you enter a replacement key.
 

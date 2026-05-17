@@ -9,12 +9,16 @@ import { ProviderError, getConfiguredImageModel } from "./image-provider.js";
 import type { ReferenceImageInput } from "../../domain/contracts.js";
 
 const DEFAULT_CODEX_IMAGE_TIMEOUT_MS = 20 * 60 * 1000;
+const DEFAULT_CODEX_RESPONSES_MODEL = "gpt-5.5";
+const CODEX_IMAGE_INSTRUCTIONS =
+  "Use the image_generation tool to create exactly one image for the user's request. Return the generated image result.";
 const MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024;
 const SUPPORTED_REFERENCE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp"]);
 
 export interface CodexImageProviderConfig {
   baseURL: string;
-  model: string;
+  responsesModel: string;
+  imageModel: string;
   timeoutMs: number;
   getSession: (signal?: AbortSignal) => Promise<CodexAccessSession | undefined>;
 }
@@ -23,9 +27,16 @@ type ResponsesImageInput = ImageProviderInput | EditImageProviderInput;
 
 interface ResponsesImageTool {
   type: "image_generation";
+  model: string;
+  action: "generate" | "edit";
   size: string;
   quality: string;
-  format: string;
+  output_format: string;
+}
+
+export interface CodexResponsesRequestBodyOptions {
+  responsesModel?: string;
+  imageModel?: string;
 }
 
 export function getCodexImageProviderTimeoutMs(): number {
@@ -33,20 +44,32 @@ export function getCodexImageProviderTimeoutMs(): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_CODEX_IMAGE_TIMEOUT_MS;
 }
 
+export function getCodexResponsesModel(): string {
+  return process.env.CODEX_RESPONSES_MODEL?.trim() || DEFAULT_CODEX_RESPONSES_MODEL;
+}
+
 export function createCodexImageProvider(config: CodexImageProviderConfig): ImageProvider {
   return new CodexResponsesImageProvider(config);
 }
 
-export function createCodexResponsesRequestBody(input: ResponsesImageInput): Record<string, unknown> {
+export function createCodexResponsesRequestBody(
+  input: ResponsesImageInput,
+  options: CodexResponsesRequestBodyOptions = {}
+): Record<string, unknown> {
+  const imageModel = options.imageModel ?? getConfiguredImageModel();
   const tool: ResponsesImageTool = {
     type: "image_generation",
+    model: imageModel,
+    action: "referenceImages" in input ? "edit" : "generate",
     size: input.sizeApiValue,
     quality: input.quality,
-    format: input.outputFormat
+    output_format: input.outputFormat
   };
 
   return {
-    model: getConfiguredImageModel(),
+    model: options.responsesModel ?? getCodexResponsesModel(),
+    instructions: CODEX_IMAGE_INSTRUCTIONS,
+    store: false,
     input: [
       {
         role: "user",
@@ -157,17 +180,17 @@ class CodexResponsesImageProvider implements ImageProvider {
       const response = await fetch(`${this.config.baseURL.replace(/\/+$/u, "")}/responses`, {
         method: "POST",
         headers: codexRequestHeaders(session),
-        body: JSON.stringify({
-          ...createCodexResponsesRequestBody(input),
-          model: this.config.model
-        }),
+        body: JSON.stringify(createCodexResponsesRequestBody(input, {
+          responsesModel: this.config.responsesModel,
+          imageModel: this.config.imageModel
+        })),
         signal: timeout.signal
       }).catch((error: unknown) => {
         throw fetchFailureToProviderError(error);
       });
 
       if (!response.ok) {
-        throw codexHttpProviderError(response.status);
+        throw await codexHttpProviderErrorFromResponse(response);
       }
 
       const events = await readCodexResponseEvents(response);
@@ -177,7 +200,7 @@ class CodexResponsesImageProvider implements ImageProvider {
       }
 
       return {
-        model: this.config.model,
+        model: this.config.imageModel,
         size: input.sizeApiValue,
         images: images.map((image) => ({
           b64Json: image
@@ -279,6 +302,53 @@ function normalizeImageBase64(value: unknown): string | undefined {
   const trimmed = value.trim();
   const dataUrlMatch = /^data:image\/[^;,]+;base64,(.+)$/u.exec(trimmed);
   return dataUrlMatch?.[1] ?? trimmed;
+}
+
+async function codexHttpProviderErrorFromResponse(response: Response): Promise<ProviderError> {
+  const status = response.status;
+  if (status === 401 || status === 403) {
+    return new ProviderError("upstream_failure", "Codex image service authentication failed. Please log in to Codex again.", status);
+  }
+
+  const detail = sanitizeCodexErrorDetail(await readCodexErrorDetail(response));
+  const suffix = detail ? `: ${detail}` : "";
+  return new ProviderError("upstream_failure", `Codex image service request failed (HTTP ${status})${suffix}`, providerHttpStatus(status));
+}
+
+async function readCodexErrorDetail(response: Response): Promise<string | undefined> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    const body = await response.json().catch(() => undefined);
+    return extractCodexErrorDetail(body);
+  }
+
+  return response.text().catch(() => undefined);
+}
+
+function extractCodexErrorDetail(value: unknown): string | undefined {
+  const record = objectValue(value);
+  if (!record) {
+    return typeof value === "string" ? value : undefined;
+  }
+
+  const detail = record.detail ?? record.message;
+  if (typeof detail === "string") {
+    return detail;
+  }
+
+  const error = objectValue(record.error);
+  return typeof error?.message === "string" ? error.message : undefined;
+}
+
+function sanitizeCodexErrorDetail(value: string | undefined): string | undefined {
+  const sanitized = value
+    ?.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, "sk-[redacted]")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 500);
+
+  return sanitized || undefined;
 }
 
 function codexHttpProviderError(status: number): ProviderError {
