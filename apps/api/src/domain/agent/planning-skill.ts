@@ -138,6 +138,11 @@ Pattern D: human-in-loop
 - If the request is ambiguous between editing selected originals and generating a new design, return AgentUserQuestion with code "agent_requires_user_input" only when the selected reference context does not already make the user's intent clear.
 - Do not return AgentUserQuestion for straightforward selected-reference edits such as adding text, captions, titles, or typography to each selected image. Plan the edit jobs instead.
 - Do not invent or hallucinate selected_canvas_image references.
+
+Anti-patterns:
+- Do not collapse an explicit request for N images, variants, or different prompts into one selected-image edit job with count 1. Preserve the requested final output count even when one or more canvas references are selected.
+- Do not treat "collage-style", "magazine collage", or similar visual-style language as a request to combine selected references. Combine selected references only when the user explicitly asks to combine, merge, compare, or make one image/poster from multiple selected images.
+- When up to 3 selected references are present and the user asks for N variants, it is valid to create N final_image jobs that each reference the selected source set and use distinct prompts.
 `;
 
 export const ECOMMERCE_VISUAL_COPYWRITING_SKILL = `---

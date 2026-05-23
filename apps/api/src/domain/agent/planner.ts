@@ -48,6 +48,13 @@ const DEFAULT_PLAN_COUNT = 1;
 const MAX_PLANNER_REFLECTION_ATTEMPTS = 1;
 const PLANNER_REFLECTION_OUTPUT_PREVIEW_LIMIT = 6000;
 const PLANNER_REFLECTION_ISSUE_LIMIT = 8;
+const FALLBACK_VARIANT_DIRECTIONS = [
+  "bold chrome typography and high-contrast editorial flash",
+  "pastel magazine collage with softer UI stickers and glossy accents",
+  "grunge Y2K layout with silver holographic elements and dense type",
+  "cyber UI grid composition with neon sticker details",
+  "polished luxury campaign layout with rainbow holographic highlights"
+] as const;
 
 const GENERATION_JOB_ROLES: readonly GenerationJobRole[] = [
   "final_image",
@@ -431,10 +438,11 @@ function evaluatePlannerAttemptOutput(input: {
       };
     }
 
-    return fallbackPlan
+    const usableFallbackPlan = fallbackPlan && planSatisfiesRequestedOutputCount(fallbackPlan, input.userText);
+    return usableFallbackPlan
       ? {
           ok: true,
-          plan: fallbackPlan
+          plan: usableFallbackPlan
         }
       : {
           ok: false,
@@ -469,16 +477,33 @@ function evaluatePlannerAttemptOutput(input: {
     selectedReferences: input.selectedReferences
   });
   if (selectedReferenceEditIssue) {
-    return fallbackPlan
+    const usableFallbackPlan = fallbackPlan && planSatisfiesRequestedOutputCount(fallbackPlan, input.userText);
+    return usableFallbackPlan
       ? {
           ok: true,
-          plan: fallbackPlan
+          plan: usableFallbackPlan
         }
       : {
           ok: false,
           shouldReflect: true,
           previousOutput,
           failure: selectedReferenceEditIssue
+        };
+  }
+
+  const requestedOutputCountIssue = validateRequestedOutputCount(validated.plan, input.userText);
+  if (requestedOutputCountIssue) {
+    const usableFallbackPlan = fallbackPlan && planSatisfiesRequestedOutputCount(fallbackPlan, input.userText);
+    return usableFallbackPlan
+      ? {
+          ok: true,
+          plan: usableFallbackPlan
+        }
+      : {
+          ok: false,
+          shouldReflect: true,
+          previousOutput,
+          failure: requestedOutputCountIssue
         };
   }
 
@@ -827,6 +852,7 @@ export function buildPlannerUserMessage(input: {
   const referenceSummaries = input.selectedReferences.map((reference, index) =>
     formatReferenceSummary(reference, index, input.supportsVision)
   );
+  const requestedOutputCount = requestedOutputCountFromUserText(input.userText);
   const contextSummary = formatConversationContextSummary(input.conversationContext);
   const clarificationSummary = formatClarificationFollowUpSummary(input.userText, input.conversationContext);
   const text = [
@@ -842,8 +868,11 @@ export function buildPlannerUserMessage(input: {
     referenceSummaries.length > 0
       ? 'When a job uses a selected_canvas_image reference, set assetId to one of the listed handles such as "ref1", the listed id, or the listed assetId.'
       : "Do not create selected_canvas_image references because no canvas references are selected.",
+    requestedOutputCount
+      ? `Detected explicit requested final output count: ${requestedOutputCount}. The plan must produce at least ${requestedOutputCount} final output image(s), unless that would exceed the 16-image cap or conflict with a safety/user-input gate. Do not collapse a request for ${requestedOutputCount} variants/prompts/images into a single selected-image edit job with count 1.`
+      : "",
     referenceSummaries.length > 0 && hasSelectedReferenceEditIntent(input.userText, input.selectedReferences.length)
-      ? "Selected-image edit mode: the user is asking to work on the selected/original image(s). Preserve those images as the source. Create edit jobs with selected_canvas_image references; for each/every selected image, create one final_image job per ref with count 1 and exactly one selected_canvas_image reference. Prompts must say to edit the original directly and must forbid blank poster templates, generic geometric backgrounds, or unrelated replacement images."
+      ? "Selected-image edit mode: the user is asking to work on the selected/original image(s). Preserve those images as the source. Create edit jobs with selected_canvas_image references; for each/every selected image, create one final_image job per ref with count 1 and exactly one selected_canvas_image reference. If the user explicitly requests multiple variants/prompts/output images, preserve that output count. Prompts must say to edit the original directly and must forbid blank poster templates, generic geometric backgrounds, or unrelated replacement images."
       : "",
     referenceSummaries.length === 0 && hasSelectedReferenceEditIntent(input.userText, 0)
       ? 'The request appears to depend on original/selected canvas images, but none are selected. Return an AgentUserQuestion with code "missing_selected_canvas_reference".'
@@ -982,11 +1011,46 @@ function createSelectedReferenceEditFallbackPlan(input: {
 
   const timestamp = input.now.toISOString();
   const references = input.selectedReferences.slice(0, MAX_AGENT_SELECTED_REFERENCES);
+  const requestedOutputCount = requestedOutputCountFromUserText(input.userText);
   if (intent.allowsCombinedReferences && intent.requiresSingleCombinedOutput && references.length > MAX_REFERENCE_IMAGES) {
     return undefined;
   }
 
-  const jobs: GenerationJob[] = intent.allowsCombinedReferences
+  let jobs: GenerationJob[] | undefined;
+  if (requestedOutputCount && requestedOutputCount > 1) {
+    if (
+      intent.requiresEverySelectedReference &&
+      !intent.allowsCombinedReferences &&
+      references.length * requestedOutputCount <= MAX_GENERATION_PLAN_IMAGES
+    ) {
+      jobs = references.map((reference, index) => ({
+        id: `edit_selected_${index + 1}`,
+        role: "final_image",
+        prompt: selectedReferenceFallbackPrompt(
+          input.userText,
+          `Edit selected canvas image ref${index + 1} directly and create ${requestedOutputCount} distinct variants`
+        ),
+        count: requestedOutputCount,
+        references: [selectedReferenceForFallbackJob(reference)],
+        status: "queued",
+        outputs: [],
+        visible: true
+      }));
+    } else if (references.length <= MAX_REFERENCE_IMAGES) {
+      jobs = Array.from({ length: requestedOutputCount }, (_, index) => ({
+        id: `edit_selected_variant_${index + 1}`,
+        role: "final_image",
+        prompt: selectedReferenceVariantFallbackPrompt(input.userText, index + 1, requestedOutputCount),
+        count: 1,
+        references: references.map((reference) => selectedReferenceForFallbackJob(reference)),
+        status: "queued",
+        outputs: [],
+        visible: true
+      }));
+    }
+  }
+
+  jobs ??= intent.allowsCombinedReferences && references.length <= MAX_REFERENCE_IMAGES
     ? [
         {
           id: "edit_selected_combined",
@@ -1016,7 +1080,11 @@ function createSelectedReferenceEditFallbackPlan(input: {
   return {
     schemaVersion: GENERATION_PLAN_SCHEMA_VERSION,
     id: input.planId,
-    title: references.length > 1 ? "Edit selected images" : "Edit selected image",
+    title: requestedOutputCount && requestedOutputCount > 1
+      ? `${requestedOutputCount} Selected Image Variations`
+      : references.length > 1
+        ? "Edit selected images"
+        : "Edit selected image",
     status: "awaiting_confirmation",
     defaults: input.defaults,
     jobs,
@@ -1060,6 +1128,17 @@ function selectedReferenceForFallbackJob(reference: AgentSelectedCanvasReference
 function selectedReferenceFallbackPrompt(userText: string, action: string): string {
   return [
     `${action} according to the user request: ${userText}`,
+    "Preserve the original image content, composition, perspective, and main subjects.",
+    "Add only the requested text/design treatment on top.",
+    "Do not create a blank poster template, generic geometric background, or unrelated replacement image."
+  ].join(" ");
+}
+
+function selectedReferenceVariantFallbackPrompt(userText: string, index: number, total: number): string {
+  const direction = FALLBACK_VARIANT_DIRECTIONS[(index - 1) % FALLBACK_VARIANT_DIRECTIONS.length];
+  return [
+    `Edit the selected canvas image(s) directly as requested variant ${index} of ${total}: ${userText}`,
+    `Distinct variant direction: ${direction}.`,
     "Preserve the original image content, composition, perspective, and main subjects.",
     "Add only the requested text/design treatment on top.",
     "Do not create a blank poster template, generic geometric background, or unrelated replacement image."
@@ -1129,6 +1208,150 @@ function selectedReferenceAssetIdsForFinalJobs(plan: GenerationPlan): Set<string
   }
 
   return assetIds;
+}
+
+function validateRequestedOutputCount(plan: GenerationPlan, userText: string): AgentPlannerFailure | undefined {
+  const requestedOutputCount = requestedOutputCountFromUserText(userText);
+  if (!requestedOutputCount) {
+    return undefined;
+  }
+
+  const plannedOutputCount = finalOrVariationOutputCount(plan);
+  if (plannedOutputCount >= requestedOutputCount) {
+    return undefined;
+  }
+
+  return {
+    ok: false,
+    code: "agent_requires_user_input",
+    message: `GenerationPlan produces ${plannedOutputCount} final output image(s), but the user explicitly requested at least ${requestedOutputCount}. Preserve the requested output count instead of collapsing variants into one image.`
+  };
+}
+
+function planSatisfiesRequestedOutputCount(plan: GenerationPlan, userText: string): GenerationPlan | undefined {
+  return validateRequestedOutputCount(plan, userText) ? undefined : plan;
+}
+
+function finalOrVariationOutputCount(plan: GenerationPlan): number {
+  return plan.jobs.reduce(
+    (total, job) => total + (job.role === "final_image" || job.role === "variation" ? job.count : 0),
+    0
+  );
+}
+
+function requestedOutputCountFromUserText(userText: string): number | undefined {
+  const text = userText.trim();
+  const digitPattern =
+    /(\d{1,2})\s*(?:\u5f20|\u5f35|\u5e45|\u4e2a|\u500b|\u6b3e|\u7248|\u5957|images?|pictures?|photos?|outputs?|variations?|variants?|prompts?)/giu;
+  const digitCount = firstValidRequestedOutputCount(text, digitPattern, (value) => positiveIntegerValue(value));
+  if (digitCount) {
+    return digitCount;
+  }
+
+  const descriptiveDigitPattern =
+    /\b(\d{1,2})(?:\s+[\p{L}-]+){0,6}\s+(?:images?|pictures?|photos?|outputs?|variations?|variants?|prompts?)\b/giu;
+  const descriptiveDigitCount = firstValidRequestedOutputCount(text, descriptiveDigitPattern, (value) =>
+    positiveIntegerValue(value)
+  );
+  if (descriptiveDigitCount) {
+    return descriptiveDigitCount;
+  }
+
+  const chinesePattern =
+    /([\u4e00\u4e8c\u4e24\u5169\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{1,3})\s*(?:\u5f20|\u5f35|\u5e45|\u4e2a|\u500b|\u6b3e|\u7248|\u5957)/gu;
+  const chineseCount = firstValidRequestedOutputCount(text, chinesePattern, parseChineseCountToken);
+  if (chineseCount) {
+    return chineseCount;
+  }
+
+  const englishPattern =
+    /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen)(?:\s+[\p{L}-]+){0,6}\s+(?:images?|pictures?|photos?|outputs?|variations?|variants?|prompts?)\b/giu;
+  return firstValidRequestedOutputCount(text, englishPattern, parseEnglishCountToken);
+}
+
+function firstValidRequestedOutputCount(
+  text: string,
+  pattern: RegExp,
+  parseToken: (token: string) => number | undefined
+): number | undefined {
+  for (const match of text.matchAll(pattern)) {
+    const count = parseToken(match[1] ?? "");
+    if (count && count <= MAX_GENERATION_PLAN_IMAGES && !isLikelyReferenceCountMention(text, match)) {
+      return count;
+    }
+  }
+
+  return undefined;
+}
+
+function isLikelyReferenceCountMention(text: string, match: RegExpMatchArray): boolean {
+  const matchedText = match[0]?.toLowerCase() ?? "";
+  if (/\b(?:selected|source|reference|original|canvas)\s+(?:images?|pictures?|photos?)\b/u.test(matchedText)) {
+    return true;
+  }
+
+  const start = match.index ?? 0;
+  const end = start + matchedText.length;
+  const followingText = text.slice(end, end + 64).toLowerCase();
+  return (
+    /\b(?:into|to|as)\s+(?:one|1|a single|single)\b/u.test(followingText) ||
+    /(?:\u56fe|\u56fe\u7247)?\s*(?:\u7ec4\u5408|\u5408\u6210|\u62fc\u6210|\u505a\u6210)\s*\u4e00\s*(?:\u5f20|\u5f35|\u4e2a|\u500b)/u.test(
+      followingText
+    )
+  );
+}
+
+function parseChineseCountToken(token: string): number | undefined {
+  const digits: Record<string, number> = {
+    "\u4e00": 1,
+    "\u4e8c": 2,
+    "\u4e24": 2,
+    "\u5169": 2,
+    "\u4e09": 3,
+    "\u56db": 4,
+    "\u4e94": 5,
+    "\u516d": 6,
+    "\u4e03": 7,
+    "\u516b": 8,
+    "\u4e5d": 9
+  };
+  if (token === "\u5341") {
+    return 10;
+  }
+
+  const tenIndex = token.indexOf("\u5341");
+  if (tenIndex >= 0) {
+    const before = token.slice(0, tenIndex);
+    const after = token.slice(tenIndex + 1);
+    const tens = before ? digits[before] : 1;
+    const ones = after ? digits[after] : 0;
+    const count = typeof tens === "number" && typeof ones === "number" ? tens * 10 + ones : undefined;
+    return count && count <= MAX_GENERATION_PLAN_IMAGES ? count : undefined;
+  }
+
+  return digits[token];
+}
+
+function parseEnglishCountToken(token: string): number | undefined {
+  const counts: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+    thirteen: 13,
+    fourteen: 14,
+    fifteen: 15,
+    sixteen: 16
+  };
+  return counts[token.toLowerCase()];
 }
 
 function selectedReferenceEditIntent(

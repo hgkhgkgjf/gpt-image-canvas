@@ -10,6 +10,7 @@ import {
   type AgentErrorEvent,
   type AgentSelectedCanvasReference,
   type AgentServerEvent,
+  type AgentToolCallEvent,
   type GeneratedAsset,
   type GenerationPlan
 } from "../contracts.js";
@@ -495,6 +496,33 @@ async function handleAgentPlanMessage(
     resolvedConversationReferences,
     resolvedConversationReferences ? "previous_agent_outputs" : clientSelectedReferences.length > 0 ? "manual_selection" : undefined
   );
+  const planningSkillLoadout = resolvePlanningSkillLoadoutForRequest(message.text);
+  const plannerToolCallId = `tool-call-${randomUUID()}`;
+  const plannerStartedAt = Date.now();
+  sendAgentToolCallEvent(session, {
+    phase: "started",
+    toolCallId: plannerToolCallId,
+    toolName: "create_generation_plan",
+    requestId: message.requestId,
+    runId: activeRun.id,
+    input: {
+      userText: message.text,
+      defaults: message.defaults,
+      plannerOptions: message.plannerOptions,
+      selectedReferences: effectiveSelectedReferences.map(agentSelectedReferenceTrace),
+      conversationContext: conversationContext
+        ? {
+            previousPlanId: conversationContext.previousPlan?.id,
+            previousOutputCount: conversationContext.previousOutputs?.length ?? 0,
+            resolvedReferenceCount: conversationContext.resolvedReferences?.length ?? 0,
+            referenceResolution: conversationContext.referenceResolution
+          }
+        : undefined,
+      model: llmConfig.model,
+      supportsVision: llmConfig.supportsVision,
+      skills: planningSkillLoadout.skills.map((skill) => skill.slug)
+    }
+  });
 
   try {
     result = await createGenerationPlan({
@@ -504,7 +532,7 @@ async function handleAgentPlanMessage(
       conversationContext,
       plannerOptions: message.plannerOptions,
       llmConfig,
-      skillLoadout: resolvePlanningSkillLoadoutForRequest(message.text),
+      skillLoadout: planningSkillLoadout,
       onAssistantDelta: (delta) => {
         if (session.activeRun?.id !== activeRun.id || activeRun.cancelled) {
           return;
@@ -544,6 +572,29 @@ async function handleAgentPlanMessage(
   if (session.activeRun?.id !== activeRun.id || activeRun.cancelled) {
     return;
   }
+
+  sendAgentToolCallEvent(session, {
+    phase: result.ok ? "completed" : "failed",
+    toolCallId: plannerToolCallId,
+    toolName: "create_generation_plan",
+    requestId: message.requestId,
+    runId: activeRun.id,
+    durationMs: Date.now() - plannerStartedAt,
+    output: result.ok
+      ? {
+          planId: result.plan.id,
+          title: result.plan.title,
+          status: result.plan.status,
+          jobCount: result.plan.jobs.length,
+          totalImageCount: result.plan.jobs.reduce((total, job) => total + job.count, 0)
+        }
+      : {
+          code: result.code,
+          message: result.message,
+          issueCount: result.issues?.length ?? 0
+        },
+    error: result.ok ? undefined : result.message
+  });
 
   session.activeRun = undefined;
   scheduleDisconnectedSessionCleanup(session);
@@ -755,6 +806,11 @@ function fileNameForSelectedReference(reference: AgentSelectedCanvasReference): 
 
 function sanitizeSelectedReferencesForStorage(references: AgentSelectedCanvasReference[]): AgentSelectedCanvasReference[] {
   return references.map(({ dataUrl: _dataUrl, ...reference }) => reference);
+}
+
+function agentSelectedReferenceTrace(reference: AgentSelectedCanvasReference): Omit<AgentSelectedCanvasReference, "dataUrl"> {
+  const { dataUrl: _dataUrl, ...traceReference } = reference;
+  return traceReference;
 }
 
 function storeConversationContextForSession(session: AgentSocketSession): void {
@@ -1281,6 +1337,18 @@ function sendSessionError(
     timestamp: new Date().toISOString(),
     ...input
   });
+}
+
+function sendAgentToolCallEvent(
+  session: AgentSocketSession,
+  input: Omit<AgentToolCallEvent, "type" | "timestamp">
+): void {
+  const event: AgentToolCallEvent = {
+    type: "tool_call",
+    timestamp: new Date().toISOString(),
+    ...input
+  };
+  sendSessionEvent(session, event);
 }
 
 function sendSessionEvent(session: AgentSocketSession, event: AgentServerEvent): void {

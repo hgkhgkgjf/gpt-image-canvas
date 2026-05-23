@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   composePrompt,
   MAX_GENERATION_JOB_REFERENCES,
@@ -5,6 +6,7 @@ import {
   sizeToApiValue,
   type AgentSelectedCanvasReference,
   type AgentServerEvent,
+  type AgentToolCallEvent,
   type GeneratedAsset,
   type GenerationJob,
   type GenerationOutput,
@@ -199,6 +201,26 @@ async function executeGenerationJob(input: AgentPlanExecutionInput & {
   emitJobStarted(input, input.plan, input.job.id);
   emitPlanUpdated(input, input.plan);
 
+  const toolCallId = `tool-call-${randomUUID()}`;
+  const toolStartedAt = Date.now();
+  emitToolCall(input, input.plan, input.job.id, {
+    phase: "started",
+    toolCallId,
+    toolName: "generate_canvas_image_job",
+    input: {
+      planId: input.plan.id,
+      jobId: input.job.id,
+      role: input.job.role,
+      prompt: input.job.prompt,
+      count: input.job.count,
+      size: input.job.size ?? input.plan.defaults.size,
+      quality: input.job.quality ?? input.plan.defaults.quality,
+      outputFormat: input.job.outputFormat ?? input.plan.defaults.outputFormat,
+      referenceCount: input.job.references.length,
+      references: input.job.references.map((reference) => ({ ...reference }))
+    }
+  });
+
   try {
     throwIfAborted(input.signal);
     const references = await resolveJobReferences(input.plan, input.job, input.selectedReferencesByKey);
@@ -229,6 +251,21 @@ async function executeGenerationJob(input: AgentPlanExecutionInput & {
         ? response.record.error ?? failedOutputs[0]?.error ?? "Agent image generation failed."
         : undefined;
     input.plan.updatedAt = new Date().toISOString();
+    emitToolCall(input, input.plan, input.job.id, {
+      phase: input.job.status === "succeeded" ? "completed" : "failed",
+      toolCallId,
+      toolName: "generate_canvas_image_job",
+      durationMs: Date.now() - toolStartedAt,
+      output: {
+        generationId: response.record.id,
+        status: response.record.status,
+        outputCount: response.record.outputs.length,
+        successfulOutputCount: successfulOutputs.length,
+        failedOutputCount: failedOutputs.length,
+        referenceAssetIds: references.referenceAssetIds
+      },
+      error: input.job.error
+    });
 
     for (const output of successfulOutputs) {
       if (output.asset) {
@@ -247,6 +284,13 @@ async function executeGenerationJob(input: AgentPlanExecutionInput & {
       input.job.status = "cancelled";
       input.job.error = "Agent run was cancelled.";
       input.plan.updatedAt = new Date().toISOString();
+      emitToolCall(input, input.plan, input.job.id, {
+        phase: "failed",
+        toolCallId,
+        toolName: "generate_canvas_image_job",
+        durationMs: Date.now() - toolStartedAt,
+        error: input.job.error
+      });
       emitPlanUpdated(input, input.plan);
       return;
     }
@@ -255,6 +299,13 @@ async function executeGenerationJob(input: AgentPlanExecutionInput & {
     input.job.outputs = [];
     input.job.error = errorToMessage(error);
     input.plan.updatedAt = new Date().toISOString();
+    emitToolCall(input, input.plan, input.job.id, {
+      phase: "failed",
+      toolCallId,
+      toolName: "generate_canvas_image_job",
+      durationMs: Date.now() - toolStartedAt,
+      error: input.job.error
+    });
     emitJobFailed(input, input.plan, input.job.id, input.job.error);
     emitPlanUpdated(input, input.plan);
   }
@@ -502,6 +553,24 @@ function emitJobStarted(input: AgentPlanExecutionInput, plan: GenerationPlan, jo
     jobId,
     timestamp: new Date().toISOString()
   });
+}
+
+function emitToolCall(
+  input: AgentPlanExecutionInput,
+  plan: GenerationPlan,
+  jobId: string,
+  event: Omit<AgentToolCallEvent, "type" | "timestamp" | "requestId" | "runId" | "planId" | "jobId">
+): void {
+  const toolEvent: AgentToolCallEvent = {
+    type: "tool_call",
+    requestId: input.requestId,
+    runId: input.runId,
+    planId: plan.id,
+    jobId,
+    timestamp: new Date().toISOString(),
+    ...event
+  };
+  input.sendEvent(toolEvent);
 }
 
 function emitJobCompleted(

@@ -13,6 +13,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FileText,
   History,
   ImageIcon,
   KeyRound,
@@ -98,6 +99,7 @@ import {
   type AgentSelectedCanvasReference,
   type AgentServerEvent,
   type AgentThinkingType,
+  type AgentTraceEntry,
   type AuthStatusResponse,
   type AssetMetadataResponse,
   type CloudStorageProvider,
@@ -145,6 +147,10 @@ const AGENT_SOCKET_RECONNECT_INITIAL_MS = 500;
 const AGENT_SOCKET_RECONNECT_MAX_MS = 10_000;
 const AGENT_SOCKET_RECONNECT_WINDOW_MS = 2 * 60 * 60 * 1000;
 const AGENT_HISTORY_SAVE_DEBOUNCE_MS = 600;
+const AGENT_TRACE_ENTRY_LIMIT = 1000;
+const AGENT_TRACE_VISIBLE_LIMIT = 80;
+const AGENT_TRACE_MAX_STRING_LENGTH = 120_000;
+const AGENT_TRACE_DEBUG_ENABLED = import.meta.env.VITE_AGENT_TRACE_DEBUG === "true";
 const HISTORY_COLLAPSED_LIMIT = 3;
 const MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024;
 const MOBILE_DRAWER_MEDIA_QUERY = "(max-width: 1023px)";
@@ -226,10 +232,25 @@ function agentThinkingDisabledLabel(locale: Locale): string {
 
 function agentThinkingRawToggleLabel(locale: Locale, expanded: boolean): string {
   if (locale === "zh-CN") {
-    return expanded ? "收起原始思考" : "查看原始思考";
+    return expanded ? "收起推理摘要" : "查看推理摘要";
   }
 
-  return expanded ? "Hide raw reasoning" : "Show raw reasoning";
+  return expanded ? "Hide reasoning summary" : "Show reasoning summary";
+}
+
+function agentThinkingDetailsSummary(locale: Locale, characterCount: number): string {
+  return locale === "zh-CN"
+    ? `已收到 ${characterCount} 个字符的推理流。普通对话只保留当前进度，调试事件可在 Agent 调试记录中导出。`
+    : `Received ${characterCount} characters of reasoning stream. The conversation only keeps current progress; debug events can be exported from Agent debug trace.`;
+}
+
+function reasoningDetailsCharacterCount(details: string | undefined): number {
+  if (!details) {
+    return 0;
+  }
+
+  const match = details.match(/(?:已收到|Received)\s+(\d+)/u);
+  return match?.[1] ? Number.parseInt(match[1], 10) || 0 : 0;
 }
 
 function agentPreviewDisclosureLabel(locale: Locale, count: number): string {
@@ -450,6 +471,14 @@ function agentChatMessagesFromConversation(messages: AgentConversationMessage[])
       }
     ];
   });
+}
+
+function copyableThinkingMessageText(message: Pick<AgentChatMessage, "content" | "details">): string {
+  if (!AGENT_TRACE_DEBUG_ENABLED || !message.details) {
+    return message.content;
+  }
+
+  return reasoningDetailsCharacterCount(message.details) > 0 ? `${message.content}\n\n${message.details}` : message.content;
 }
 
 interface GenerationSubmitInput {
@@ -934,8 +963,13 @@ function promptFavoriteMeta(favorite: PromptFavoriteItem, t: Translate): string 
 
 async function writeClipboardText(text: string): Promise<void> {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall through to the textarea fallback for browser contexts that expose
+      // the Clipboard API but reject writes without an explicit permission grant.
+    }
   }
 
   const textArea = document.createElement("textarea");
@@ -2147,6 +2181,278 @@ function parseAgentServerEvent(data: MessageEvent["data"]): AgentServerEvent | u
   }
 }
 
+function agentTracePhaseForServerEvent(event: AgentServerEvent): AgentTraceEntry["phase"] {
+  switch (event.type) {
+    case "assistant_delta":
+    case "assistant_thinking_delta":
+      return "stream";
+    case "tool_call":
+      return "tool_call";
+    case "plan_created":
+    case "plan_updated":
+      return "planning";
+    case "job_started":
+    case "job_completed":
+    case "job_failed":
+    case "job_blocked":
+    case "asset_preview":
+    case "run_done":
+    case "run_cancelled":
+      return "execution";
+    case "error":
+      return "error";
+    case "connected":
+    case "pong":
+      return "connection";
+    case "context_resolved":
+    default:
+      return "system";
+  }
+}
+
+function agentTracePhaseForClientMessage(message: Record<string, unknown>): AgentTraceEntry["phase"] {
+  switch (message.type) {
+    case "user_message":
+    case "revise_plan":
+      return "planning";
+    case "execute_plan":
+    case "retry_failed":
+    case "cancel_run":
+      return "execution";
+    case "ping":
+      return "connection";
+    default:
+      return "system";
+  }
+}
+
+function agentServerTraceLabel(event: AgentServerEvent): string {
+  if (event.type === "tool_call") {
+    return `${event.toolName} ${event.phase}`;
+  }
+
+  if ("jobId" in event && typeof event.jobId === "string") {
+    return `${event.type} ${event.jobId}`;
+  }
+
+  return event.type;
+}
+
+function agentServerTraceSummary(event: AgentServerEvent): string | undefined {
+  switch (event.type) {
+    case "assistant_delta":
+    case "assistant_thinking_delta":
+      return `${event.delta.length} streamed characters`;
+    case "tool_call":
+      return event.error || (event.durationMs !== undefined ? `${event.durationMs} ms` : undefined);
+    case "plan_created":
+    case "plan_updated":
+      return `${event.plan.title} (${event.plan.jobs.length} jobs)`;
+    case "job_completed":
+      return `${event.outputs?.length ?? 0} outputs`;
+    case "job_failed":
+      return event.error;
+    case "job_blocked":
+      return event.reason;
+    case "asset_preview":
+      return event.asset.fileName;
+    case "run_done":
+      return event.status;
+    case "run_cancelled":
+      return event.reason;
+    case "error":
+      return event.message;
+    case "context_resolved":
+      return `${event.referenceCount} references`;
+    default:
+      return undefined;
+  }
+}
+
+function agentClientTraceLabel(message: Record<string, unknown>): string {
+  return typeof message.type === "string" ? message.type : "client_message";
+}
+
+function sanitizeAgentTracePayload(input: unknown, depth = 0): unknown {
+  if (input === undefined) {
+    return undefined;
+  }
+
+  if (input === null || typeof input === "number" || typeof input === "boolean") {
+    return input;
+  }
+
+  if (typeof input === "string") {
+    return input.length > AGENT_TRACE_MAX_STRING_LENGTH ? `${input.slice(0, AGENT_TRACE_MAX_STRING_LENGTH - 1)}...` : input;
+  }
+
+  if (depth >= 8) {
+    return "[truncated]";
+  }
+
+  if (Array.isArray(input)) {
+    return input.slice(0, 100).map((item) => sanitizeAgentTracePayload(item, depth + 1));
+  }
+
+  if (!isRecord(input)) {
+    return undefined;
+  }
+
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input).slice(0, 100)) {
+    const normalizedKey = key.toLowerCase();
+    if (
+      normalizedKey === "dataurl" ||
+      normalizedKey === "bytes" ||
+      normalizedKey.includes("apikey") ||
+      normalizedKey.includes("secret") ||
+      normalizedKey.includes("token") ||
+      normalizedKey === "authorization"
+    ) {
+      sanitized[key] = "[redacted]";
+      continue;
+    }
+
+    sanitized[key] = sanitizeAgentTracePayload(value, depth + 1);
+  }
+
+  return sanitized;
+}
+
+function agentServerEventPayloadForTrace(event: AgentServerEvent): unknown {
+  if (event.type !== "assistant_thinking_delta") {
+    return event;
+  }
+
+  return {
+    ...event,
+    delta: "[redacted_reasoning_delta]",
+    deltaCharacters: event.delta.length
+  };
+}
+
+function agentTraceEntryFromServerEvent(event: AgentServerEvent): AgentTraceEntry {
+  return {
+    id: `agent-trace-${crypto.randomUUID()}`,
+    timestamp: event.timestamp || new Date().toISOString(),
+    direction: "server",
+    phase: agentTracePhaseForServerEvent(event),
+    eventType: event.type,
+    label: agentServerTraceLabel(event),
+    requestId: event.requestId,
+    runId: event.runId,
+    toolName: event.type === "tool_call" ? event.toolName : undefined,
+    status: event.type === "tool_call" ? event.phase : undefined,
+    durationMs: event.type === "tool_call" ? event.durationMs : undefined,
+    summary: agentServerTraceSummary(event),
+    payload: sanitizeAgentTracePayload(agentServerEventPayloadForTrace(event))
+  };
+}
+
+function agentTraceEntryFromClientMessage(message: Record<string, unknown>, label = agentClientTraceLabel(message)): AgentTraceEntry {
+  return {
+    id: `agent-trace-${crypto.randomUUID()}`,
+    timestamp: new Date().toISOString(),
+    direction: "client",
+    phase: agentTracePhaseForClientMessage(message),
+    eventType: typeof message.type === "string" ? message.type : "client_message",
+    label,
+    requestId: typeof message.requestId === "string" ? message.requestId : undefined,
+    runId: typeof message.runId === "string" ? message.runId : undefined,
+    summary: typeof message.type === "string" ? `Sent ${message.type}` : undefined,
+    payload: sanitizeAgentTracePayload(message)
+  };
+}
+
+function isMergeableStreamTraceEntry(entry: AgentTraceEntry, nextEntry: AgentTraceEntry): boolean {
+  return (
+    entry.direction === "server" &&
+    nextEntry.direction === "server" &&
+    entry.phase === "stream" &&
+    nextEntry.phase === "stream" &&
+    entry.eventType === nextEntry.eventType &&
+    entry.runId === nextEntry.runId
+  );
+}
+
+function mergeStreamTraceEntry(entry: AgentTraceEntry, nextEntry: AgentTraceEntry): AgentTraceEntry {
+  const currentPayload = isRecord(entry.payload) ? entry.payload : {};
+  const nextPayload = isRecord(nextEntry.payload) ? nextEntry.payload : {};
+  if (entry.eventType === "assistant_thinking_delta") {
+    const currentCount =
+      typeof currentPayload.accumulatedCharacters === "number"
+        ? currentPayload.accumulatedCharacters
+        : typeof currentPayload.deltaCharacters === "number"
+          ? currentPayload.deltaCharacters
+          : 0;
+    const nextCount = typeof nextPayload.deltaCharacters === "number" ? nextPayload.deltaCharacters : 0;
+    const characterCount = currentCount + nextCount;
+
+    return {
+      ...entry,
+      timestamp: nextEntry.timestamp,
+      summary: `${characterCount} streamed characters`,
+      payload: {
+        ...currentPayload,
+        ...nextPayload,
+        delta: "[redacted_reasoning_delta]",
+        accumulatedCharacters: characterCount
+      }
+    };
+  }
+
+  const currentDelta = typeof currentPayload.delta === "string" ? currentPayload.delta : "";
+  const nextDelta = typeof nextPayload.delta === "string" ? nextPayload.delta : "";
+  const delta = sanitizeAgentTracePayload(`${currentDelta}${nextDelta}`);
+  const characterCount = typeof delta === "string" ? delta.length : currentDelta.length + nextDelta.length;
+
+  return {
+    ...entry,
+    timestamp: nextEntry.timestamp,
+    summary: `${characterCount} streamed characters`,
+    payload: {
+      ...currentPayload,
+      ...nextPayload,
+      delta,
+      accumulatedCharacters: characterCount
+    }
+  };
+}
+
+function agentTraceExport(input: {
+  conversationId?: string | null;
+  title?: string;
+  messages: AgentConversationMessage[];
+  trace: AgentTraceEntry[];
+}): string {
+  return JSON.stringify(
+    {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      conversationId: input.conversationId ?? undefined,
+      title: input.title,
+      note: "Trace includes client messages, server events, tool calls, and safety-visible reasoning summaries. It does not expose private hidden chain-of-thought.",
+      messages: agentMessagesForTraceExport(input.messages),
+      trace: input.trace
+    },
+    null,
+    2
+  );
+}
+
+function agentMessagesForTraceExport(messages: AgentConversationMessage[]): AgentConversationMessage[] {
+  return messages.map((message) => {
+    if (message.role !== "thinking" || !message.details) {
+      return message;
+    }
+
+    return {
+      ...message,
+      details: `Reasoning details omitted from trace export (${message.details.length} characters).`
+    };
+  });
+}
+
 function optionalShapeIdFromEvent(event: AgentServerEvent): TLShapeId | undefined {
   return isRecord(event) && typeof event.shapeId === "string" ? (event.shapeId as TLShapeId) : undefined;
 }
@@ -2324,6 +2630,7 @@ function AgentHistoryDialog({
   isLoading,
   isRestoringDisabled,
   onClose,
+  onCopyTrace,
   onRestore,
   onSelectConversation,
   selectedConversationId,
@@ -2337,6 +2644,7 @@ function AgentHistoryDialog({
   isLoading: boolean;
   isRestoringDisabled: boolean;
   onClose: () => void;
+  onCopyTrace: (conversation: AgentConversation) => void;
   onRestore: (conversation: AgentConversation) => void;
   onSelectConversation: (conversationId: string) => void;
   selectedConversationId: string | null;
@@ -2425,15 +2733,28 @@ function AgentHistoryDialog({
                       <span>{t("agentHistoryMessageCount", { count: conversation.messages.length })}</span>
                     </p>
                   </div>
-                  <button
-                    className="agent-history-restore"
-                    disabled={isRestoringDisabled}
-                    type="button"
-                    onClick={() => onRestore(conversation)}
-                  >
-                    <RotateCcw className="size-4" aria-hidden="true" />
-                    {t("agentHistoryRestore")}
-                  </button>
+                  <div className="agent-history-detail__actions">
+                    {AGENT_TRACE_DEBUG_ENABLED ? (
+                      <button
+                        className="agent-history-trace"
+                        disabled={(conversation.trace?.length ?? 0) === 0}
+                        type="button"
+                        onClick={() => onCopyTrace(conversation)}
+                      >
+                        <FileText className="size-4" aria-hidden="true" />
+                        {t("agentTraceCopy")}
+                      </button>
+                    ) : null}
+                    <button
+                      className="agent-history-restore"
+                      disabled={isRestoringDisabled}
+                      type="button"
+                      onClick={() => onRestore(conversation)}
+                    >
+                      <RotateCcw className="size-4" aria-hidden="true" />
+                      {t("agentHistoryRestore")}
+                    </button>
+                  </div>
                 </div>
                 <div className="agent-history-transcript">
                   {conversation.messages.map((message) => (
@@ -2478,7 +2799,7 @@ function AgentHistoryMessage({
         <time dateTime={message.timestamp}>{formatDateTime(message.timestamp, { hour: "2-digit", minute: "2-digit" })}</time>
       </div>
       <p className="agent-message__content">{message.content}</p>
-      {message.role === "thinking" && message.details ? (
+      {AGENT_TRACE_DEBUG_ENABLED && message.role === "thinking" && message.details ? (
         <details className="agent-thinking-details">
           <summary className="agent-thinking-details__toggle">{t("agentHistoryThinkingDetails")}</summary>
           <pre className="agent-thinking-details__content">{message.details}</pre>
@@ -2505,6 +2826,60 @@ function AgentHistoryMessage({
         </div>
       ) : null}
     </article>
+  );
+}
+
+function AgentTracePanel({
+  copied,
+  entries,
+  formatDateTime,
+  onCopy,
+  t
+}: {
+  copied: boolean;
+  entries: AgentTraceEntry[];
+  formatDateTime: (value: string, options?: Intl.DateTimeFormatOptions) => string;
+  onCopy: () => void;
+  t: Translate;
+}) {
+  const visibleEntries = entries.slice(-AGENT_TRACE_VISIBLE_LIMIT);
+
+  return (
+    <section className="agent-trace-panel" aria-label={t("agentTraceTitle")} data-testid="agent-trace-panel">
+      <header className="agent-trace-panel__header">
+        <div>
+          <strong>{t("agentTraceTitle")}</strong>
+          <span>{t("agentTraceSubtitle", { count: entries.length })}</span>
+        </div>
+        <button className="agent-trace-copy" data-copied={copied} type="button" onClick={onCopy}>
+          {copied ? <Check className="size-3.5" aria-hidden="true" /> : <Copy className="size-3.5" aria-hidden="true" />}
+          {copied ? t("agentTraceCopied") : t("agentTraceCopy")}
+        </button>
+      </header>
+      <p className="agent-trace-panel__note">{t("agentTracePrivacyNote")}</p>
+      <div className="agent-trace-list">
+        {visibleEntries.length > 0 ? (
+          visibleEntries.map((entry) => (
+            <article className="agent-trace-entry" data-direction={entry.direction} data-phase={entry.phase} key={entry.id}>
+              <div className="agent-trace-entry__topline">
+                <span>{entry.direction}</span>
+                <strong>{entry.label}</strong>
+                <time dateTime={entry.timestamp}>{formatDateTime(entry.timestamp, { hour: "2-digit", minute: "2-digit" })}</time>
+              </div>
+              <div className="agent-trace-entry__chips">
+                <span>{entry.phase}</span>
+                {entry.toolName ? <span>{entry.toolName}</span> : null}
+                {entry.status ? <span>{entry.status}</span> : null}
+                {entry.durationMs !== undefined ? <span>{entry.durationMs} ms</span> : null}
+              </div>
+              {entry.summary ? <p>{entry.summary}</p> : null}
+            </article>
+          ))
+        ) : (
+          <p className="agent-trace-empty">{t("agentTraceEmpty")}</p>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -3338,6 +3713,9 @@ export function App() {
   const [agentHistoryError, setAgentHistoryError] = useState("");
   const [copiedAgentMessageId, setCopiedAgentMessageId] = useState<string | null>(null);
   const [expandedThinkingMessageIds, setExpandedThinkingMessageIds] = useState<string[]>([]);
+  const [agentTraceEntries, setAgentTraceEntries] = useState<AgentTraceEntry[]>([]);
+  const [isAgentTraceOpen, setIsAgentTraceOpen] = useState(false);
+  const [isAgentTraceCopied, setIsAgentTraceCopied] = useState(false);
   const [agentRunStatus, setAgentRunStatus] = useState<AgentRunStatus>("idle");
   const [agentReferenceSelection, setAgentReferenceSelection] = useState<AgentReferenceSelection>(() => emptyAgentReferenceSelection(t));
   const [agentThinkingType, setAgentThinkingType] = useState<AgentThinkingType>("enabled");
@@ -3360,6 +3738,8 @@ export function App() {
   const activeAgentRunIdRef = useRef<string | null>(null);
   const currentAgentConversationIdRef = useRef<string | null>(null);
   currentAgentConversationIdRef.current = currentAgentConversationId;
+  const agentTraceEntriesRef = useRef<AgentTraceEntry[]>([]);
+  agentTraceEntriesRef.current = agentTraceEntries;
   const agentHistorySaveTimerRef = useRef<number | undefined>();
   const agentHistorySaveRequestRef = useRef(0);
   const agentTranscriptRef = useRef<HTMLElement | null>(null);
@@ -3369,6 +3749,7 @@ export function App() {
   const agentPlanSelectedReferencesRef = useRef<Map<string, AgentSelectedCanvasReference[]>>(new Map());
   const agentPlaceholderRequestRef = useRef(0);
   const agentCopyResetTimerRef = useRef<number | undefined>();
+  const agentTraceCopyResetTimerRef = useRef<number | undefined>();
   const agentPlanCreatedRunIdsRef = useRef<Set<string>>(new Set());
   const agentUserInputRunIdsRef = useRef<Set<string>>(new Set());
   const saveTimerRef = useRef<number | undefined>();
@@ -3654,6 +4035,7 @@ export function App() {
       window.clearTimeout(agentHistorySaveTimerRef.current);
       agentHistorySaveTimerRef.current = undefined;
       window.clearTimeout(agentCopyResetTimerRef.current);
+      window.clearTimeout(agentTraceCopyResetTimerRef.current);
       window.clearTimeout(codexPollTimerRef.current);
       window.clearTimeout(favoriteCopyTimerRef.current);
     };
@@ -3765,14 +4147,14 @@ export function App() {
     window.clearTimeout(agentHistorySaveTimerRef.current);
     agentHistorySaveTimerRef.current = window.setTimeout(() => {
       agentHistorySaveTimerRef.current = undefined;
-      void saveAgentConversationNow(currentAgentConversationId, agentMessages);
+      void saveAgentConversationNow(currentAgentConversationId, agentMessages, agentTraceEntriesRef.current);
     }, AGENT_HISTORY_SAVE_DEBOUNCE_MS);
 
     return () => {
       window.clearTimeout(agentHistorySaveTimerRef.current);
       agentHistorySaveTimerRef.current = undefined;
     };
-  }, [agentMessages, currentAgentConversationId]);
+  }, [agentMessages, agentTraceEntries, currentAgentConversationId]);
 
   useEffect(() => {
     if (isAuthLoading || !authStatus || route === "gallery" || route === "pool") {
@@ -4801,7 +5183,11 @@ export function App() {
     return conversationId;
   }
 
-  async function saveAgentConversationNow(conversationId: string, messages: AgentChatMessage[]): Promise<void> {
+  async function saveAgentConversationNow(
+    conversationId: string,
+    messages: AgentChatMessage[],
+    trace = agentTraceEntriesRef.current
+  ): Promise<void> {
     if (messages.length === 0) {
       return;
     }
@@ -4817,7 +5203,8 @@ export function App() {
         },
         body: JSON.stringify({
           title: agentConversationTitle(messages),
-          messages: conversationMessagesFromAgentChat(messages)
+          messages: conversationMessagesFromAgentChat(messages),
+          trace
         })
       });
 
@@ -5037,6 +5424,9 @@ export function App() {
     clearCanvasAgentPlanNodes();
     setExpandedThinkingMessageIds([]);
     setCopiedAgentMessageId(null);
+    setAgentTraceEntries([]);
+    setIsAgentTraceOpen(false);
+    setIsAgentTraceCopied(false);
     setAgentInput("");
     setIsAgentSettingsOpen(false);
     setAgentRunStatus("idle");
@@ -5051,6 +5441,7 @@ export function App() {
     currentAgentConversationIdRef.current = conversation.id;
     setCurrentAgentConversationId(conversation.id);
     setAgentMessages(agentChatMessagesFromConversation(conversation.messages));
+    setAgentTraceEntries(conversation.trace ?? []);
     setIsAgentHistoryOpen(false);
   }
 
@@ -5066,7 +5457,7 @@ export function App() {
   }
 
   async function copyAgentMessage(message: AgentChatMessage): Promise<void> {
-    const text = (message.role === "thinking" ? message.details ?? message.content : message.content).trim();
+    const text = (message.role === "thinking" ? copyableThinkingMessageText(message) : message.content).trim();
     if (!text) {
       return;
     }
@@ -5086,6 +5477,73 @@ export function App() {
         role: "error",
         content: t("agentCopyMessageFailed")
       });
+    }
+  }
+
+  function recordAgentTraceEntry(entry: AgentTraceEntry): void {
+    setAgentTraceEntries((currentEntries) => {
+      const lastEntry = currentEntries[currentEntries.length - 1];
+      const nextEntries =
+        lastEntry && isMergeableStreamTraceEntry(lastEntry, entry)
+          ? [...currentEntries.slice(0, -1), mergeStreamTraceEntry(lastEntry, entry)]
+          : [...currentEntries, entry];
+      const boundedEntries = nextEntries.slice(-AGENT_TRACE_ENTRY_LIMIT);
+      agentTraceEntriesRef.current = boundedEntries;
+      return boundedEntries;
+    });
+  }
+
+  function recordAgentClientMessageTrace(message: Record<string, unknown>, label?: string): void {
+    if (message.type === "ping") {
+      return;
+    }
+
+    recordAgentTraceEntry(agentTraceEntryFromClientMessage(message, label));
+  }
+
+  function recordAgentServerEventTrace(event: AgentServerEvent): void {
+    if (event.type === "pong") {
+      return;
+    }
+
+    recordAgentTraceEntry(agentTraceEntryFromServerEvent(event));
+  }
+
+  async function copyAgentTrace(): Promise<void> {
+    try {
+      await writeClipboardText(
+        agentTraceExport({
+          conversationId: currentAgentConversationId,
+          messages: conversationMessagesFromAgentChat(agentMessages),
+          trace: agentTraceEntriesRef.current
+        })
+      );
+      setIsAgentTraceCopied(true);
+      window.clearTimeout(agentTraceCopyResetTimerRef.current);
+      agentTraceCopyResetTimerRef.current = window.setTimeout(() => {
+        setIsAgentTraceCopied(false);
+        agentTraceCopyResetTimerRef.current = undefined;
+      }, 1600);
+    } catch {
+      addAgentMessage({
+        role: "error",
+        content: t("agentTraceCopyFailed")
+      });
+    }
+  }
+
+  async function copyAgentConversationTrace(conversation: AgentConversation): Promise<void> {
+    try {
+      await writeClipboardText(
+        agentTraceExport({
+          conversationId: conversation.id,
+          title: conversation.title,
+          messages: conversation.messages,
+          trace: conversation.trace ?? []
+        })
+      );
+    } catch {
+      setAgentHistoryError(t("agentTraceCopyFailed"));
     }
   }
 
@@ -5198,11 +5656,17 @@ export function App() {
   }
 
   function appendAgentThinkingDetailsDelta(delta: string, runId?: string): void {
-    if (!delta) {
+    if (!delta.trim()) {
+      return;
+    }
+
+    if (!AGENT_TRACE_DEBUG_ENABLED) {
+      upsertAgentThinkingSummary(runId);
       return;
     }
 
     const content = agentThinkingSummaryText(locale);
+    const deltaLength = delta.length;
     setAgentMessages((messages) => {
       let existingIndex = -1;
       for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -5217,18 +5681,8 @@ export function App() {
 
       if (existingIndex >= 0) {
         return messages.map((message, index) =>
-          index === existingIndex
-            ? {
-                ...message,
-                content,
-                details: `${message.details ?? ""}${delta}`
-              }
-            : message
+          index === existingIndex ? { ...message, content, details: agentThinkingDetailsSummary(locale, reasoningDetailsCharacterCount(message.details) + deltaLength) } : message
         );
-      }
-
-      if (!delta.trim()) {
-        return messages;
       }
 
       return [
@@ -5237,7 +5691,7 @@ export function App() {
           id: `agent-message-${crypto.randomUUID()}`,
           role: "thinking",
           content,
-          details: delta,
+          details: agentThinkingDetailsSummary(locale, deltaLength),
           timestamp: new Date().toISOString(),
           runId
         }
@@ -5606,6 +6060,8 @@ export function App() {
         }
         appendAgentThinkingDetailsDelta(event.delta, runIdForAgentEvent(event));
         return;
+      case "tool_call":
+        return;
       case "plan_created":
         if (isStaleAgentRunEvent(event)) {
           return;
@@ -5905,6 +6361,7 @@ export function App() {
           return;
         }
 
+        recordAgentServerEventTrace(event);
         handleAgentServerEvent(event);
       };
       socket.onerror = () => {
@@ -6062,18 +6519,18 @@ export function App() {
 
       pendingAgentSelectedReferencesRef.current.set(runId, selectedReferences);
       const socket = await ensureAgentSocket();
-      socket.send(
-        JSON.stringify({
-          type: "user_message",
-          requestId,
-          runId,
-          text: trimmedAgentInput,
-          defaults: agentDefaults,
-          plannerOptions: supportsAgentThinkingControls ? agentPlannerOptions : undefined,
-          selectedReferences,
-          selectedReferenceIds: selectedReferences.map((reference) => reference.assetId)
-        })
-      );
+      const message = {
+        type: "user_message",
+        requestId,
+        runId,
+        text: trimmedAgentInput,
+        defaults: agentDefaults,
+        plannerOptions: supportsAgentThinkingControls ? agentPlannerOptions : undefined,
+        selectedReferences,
+        selectedReferenceIds: selectedReferences.map((reference) => reference.assetId)
+      };
+      recordAgentClientMessageTrace(message);
+      socket.send(JSON.stringify(message));
       setAgentRunStatus("running");
     } catch (error) {
       pendingAgentSelectedReferencesRef.current.delete(runId);
@@ -6103,13 +6560,13 @@ export function App() {
       return;
     }
 
-    socket.send(
-      JSON.stringify({
-        type: "cancel_run",
-        requestId: `agent-cancel-${crypto.randomUUID()}`,
-        runId
-      })
-    );
+    const message = {
+      type: "cancel_run",
+      requestId: `agent-cancel-${crypto.randomUUID()}`,
+      runId
+    };
+    recordAgentClientMessageTrace(message);
+    socket.send(JSON.stringify(message));
   }
 
   async function sendAgentPlanAction(plan: GenerationPlan, action: AgentPlanAction): Promise<void> {
@@ -6117,13 +6574,13 @@ export function App() {
       try {
         const runId = activeAgentRunIdRef.current || undefined;
         const socket = agentSocketRef.current?.readyState === WebSocket.OPEN ? agentSocketRef.current : await ensureAgentSocket();
-        socket.send(
-          JSON.stringify({
-            type: "cancel_run",
-            requestId: `agent-plan-cancel-${crypto.randomUUID()}`,
-            runId
-          })
-        );
+        const message = {
+          type: "cancel_run",
+          requestId: `agent-plan-cancel-${crypto.randomUUID()}`,
+          runId
+        };
+        recordAgentClientMessageTrace(message, "cancel_plan_run");
+        socket.send(JSON.stringify(message));
       } catch (error) {
         addAgentMessage({
           role: "error",
@@ -6167,16 +6624,16 @@ export function App() {
       if (selectedReferences) {
         agentPlanSelectedReferencesRef.current.set(plan.id, selectedReferences);
       }
-      socket.send(
-        JSON.stringify({
-          type: action === "execute" ? "execute_plan" : "retry_failed",
-          requestId: `agent-plan-action-${crypto.randomUUID()}`,
-          runId,
-          planId: plan.id,
-          plan,
-          selectedReferences
-        })
-      );
+      const message = {
+        type: action === "execute" ? "execute_plan" : "retry_failed",
+        requestId: `agent-plan-action-${crypto.randomUUID()}`,
+        runId,
+        planId: plan.id,
+        plan,
+        selectedReferences
+      };
+      recordAgentClientMessageTrace(message);
+      socket.send(JSON.stringify(message));
       setAgentRunStatus("running");
     } catch (error) {
       if (activeAgentRunIdRef.current === runId) {
@@ -6949,6 +7406,19 @@ export function App() {
               >
                 <History className="size-4" aria-hidden="true" />
               </button>
+              {AGENT_TRACE_DEBUG_ENABLED ? (
+                <button
+                  aria-label={isAgentTraceOpen ? t("agentTraceClose") : t("agentTraceOpen")}
+                  aria-pressed={isAgentTraceOpen}
+                  className="agent-icon-button"
+                  data-testid="agent-trace-toggle"
+                  title={isAgentTraceOpen ? t("agentTraceClose") : t("agentTraceOpen")}
+                  type="button"
+                  onClick={() => setIsAgentTraceOpen((isOpen) => !isOpen)}
+                >
+                  <FileText className="size-4" aria-hidden="true" />
+                </button>
+              ) : null}
               <button
                 aria-label={t("agentNewConversation")}
                 className="agent-icon-button"
@@ -6963,6 +7433,16 @@ export function App() {
             </div>
           </div>
 
+          {AGENT_TRACE_DEBUG_ENABLED && isAgentTraceOpen ? (
+            <AgentTracePanel
+              copied={isAgentTraceCopied}
+              entries={agentTraceEntries}
+              formatDateTime={formatDateTime}
+              t={t}
+              onCopy={() => void copyAgentTrace()}
+            />
+          ) : null}
+
           <section className="agent-transcript" aria-label={t("agentTranscriptLabel")} data-testid="agent-transcript" ref={agentTranscriptRef}>
             {agentMessages.length === 0 ? (
               <div className="agent-empty-state">
@@ -6975,7 +7455,7 @@ export function App() {
                 const canCopyAgentMessage = isCopyableAgentMessageRole(message.role) && message.content.trim().length > 0;
                 const isAgentMessageCopied = copiedAgentMessageId === message.id;
                 const copyMessageLabel = isAgentMessageCopied ? t("agentCopiedMessage") : t("agentCopyMessage");
-                const hasThinkingDetails = message.role === "thinking" && Boolean(message.details?.trim());
+                const hasThinkingDetails = AGENT_TRACE_DEBUG_ENABLED && message.role === "thinking" && Boolean(message.details?.trim());
                 const isThinkingExpanded = hasThinkingDetails && expandedThinkingMessageIds.includes(message.id);
                 const thinkingToggleLabel = hasThinkingDetails ? agentThinkingRawToggleLabel(locale, isThinkingExpanded) : "";
                 const previewCount = message.previews?.length ?? 0;
@@ -7416,6 +7896,7 @@ export function App() {
           summaries={agentHistorySummaries}
           t={t}
           onClose={closeAgentHistoryDialog}
+          onCopyTrace={(conversation) => void copyAgentConversationTrace(conversation)}
           onRestore={restoreAgentConversation}
           onSelectConversation={selectAgentHistoryConversation}
         />

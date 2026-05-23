@@ -6,6 +6,9 @@ import {
   type AgentConversationMessage,
   type AgentConversationMessageRole,
   type AgentConversationSummary,
+  type AgentTraceDirection,
+  type AgentTraceEntry,
+  type AgentTracePhase,
   type GenerationPlan
 } from "../contracts.js";
 import { db } from "../../infrastructure/database.js";
@@ -16,6 +19,8 @@ const AGENT_CONVERSATION_QUERY_LIMIT = 50;
 const MAX_AGENT_CONVERSATION_MESSAGES = 200;
 const MAX_AGENT_CONVERSATION_TITLE_LENGTH = 120;
 const MAX_AGENT_CONVERSATION_PREVIEW_LENGTH = 160;
+const MAX_AGENT_TRACE_ENTRIES = 1000;
+const MAX_AGENT_TRACE_STRING_LENGTH = 20_000;
 const AGENT_CONVERSATION_ROLES: readonly AgentConversationMessageRole[] = [
   "user",
   "assistant",
@@ -24,6 +29,16 @@ const AGENT_CONVERSATION_ROLES: readonly AgentConversationMessageRole[] = [
   "error",
   "question",
   "plan"
+];
+const AGENT_TRACE_DIRECTIONS: readonly AgentTraceDirection[] = ["client", "server", "local"];
+const AGENT_TRACE_PHASES: readonly AgentTracePhase[] = [
+  "connection",
+  "planning",
+  "execution",
+  "tool_call",
+  "stream",
+  "error",
+  "system"
 ];
 
 const emptyContext: AgentConversationContextSnapshot = {
@@ -61,6 +76,7 @@ export function saveAgentConversation(input: {
   id: string;
   title?: string;
   messages: AgentConversationMessage[];
+  trace?: AgentTraceEntry[];
 }): AgentConversation {
   const id = normalizeConversationId(input.id);
   if (!id) {
@@ -71,8 +87,9 @@ export function saveAgentConversation(input: {
   const createdAt = existing?.createdAt ?? nowIso();
   const updatedAt = nowIso();
   const messages = sanitizeMessages(input.messages);
+  const trace = sanitizeTrace(input.trace);
   const title = normalizeTitle(input.title) ?? inferConversationTitle(messages) ?? existing?.title ?? "Agent conversation";
-  const messagesJson = JSON.stringify(messages);
+  const messagesJson = JSON.stringify({ messages, trace });
   const contextJson = existing?.contextJson ?? JSON.stringify(emptyContext);
 
   if (existing) {
@@ -102,6 +119,7 @@ export function saveAgentConversation(input: {
     id,
     title,
     messages,
+    trace,
     createdAt,
     updatedAt
   };
@@ -149,17 +167,19 @@ function getAgentConversationRow(conversationId: string): (typeof agentConversat
 }
 
 function toAgentConversation(row: typeof agentConversations.$inferSelect): AgentConversation {
+  const payload = parseConversationPayload(row.messagesJson);
   return {
     id: row.id,
     title: row.title,
-    messages: parseMessages(row.messagesJson),
+    messages: payload.messages,
+    trace: payload.trace,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt
   };
 }
 
 function toAgentConversationSummary(row: typeof agentConversations.$inferSelect): AgentConversationSummary {
-  const messages = parseMessages(row.messagesJson);
+  const messages = parseConversationPayload(row.messagesJson).messages;
   return {
     id: row.id,
     title: row.title,
@@ -170,12 +190,30 @@ function toAgentConversationSummary(row: typeof agentConversations.$inferSelect)
   };
 }
 
-function parseMessages(messagesJson: string): AgentConversationMessage[] {
+function parseConversationPayload(messagesJson: string): { messages: AgentConversationMessage[]; trace?: AgentTraceEntry[] } {
   try {
     const parsed = JSON.parse(messagesJson) as unknown;
-    return Array.isArray(parsed) ? sanitizeMessages(parsed) : [];
+    if (Array.isArray(parsed)) {
+      return {
+        messages: sanitizeMessages(parsed)
+      };
+    }
+
+    if (isRecord(parsed)) {
+      const trace = sanitizeTrace(parsed.trace);
+      return {
+        messages: sanitizeMessages(parsed.messages),
+        trace: trace.length > 0 ? trace : undefined
+      };
+    }
+
+    return {
+      messages: []
+    };
   } catch {
-    return [];
+    return {
+      messages: []
+    };
   }
 }
 
@@ -196,6 +234,99 @@ function sanitizeMessages(input: unknown): AgentConversationMessage[] {
     const normalized = sanitizeMessage(message);
     return normalized ? [normalized] : [];
   });
+}
+
+function sanitizeTrace(input: unknown): AgentTraceEntry[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input.slice(0, MAX_AGENT_TRACE_ENTRIES).flatMap((entry) => {
+    const normalized = sanitizeTraceEntry(entry);
+    return normalized ? [normalized] : [];
+  });
+}
+
+function sanitizeTraceEntry(input: unknown): AgentTraceEntry | undefined {
+  if (!isRecord(input)) {
+    return undefined;
+  }
+
+  const id = stringValue(input.id);
+  const timestamp = stringValue(input.timestamp);
+  const direction = isTraceDirection(input.direction) ? input.direction : undefined;
+  const phase = isTracePhase(input.phase) ? input.phase : undefined;
+  const eventType = stringValue(input.eventType);
+  const label = stringValue(input.label);
+  if (!id || !timestamp || !direction || !phase || !eventType || !label) {
+    return undefined;
+  }
+
+  const durationMs = typeof input.durationMs === "number" && Number.isFinite(input.durationMs) && input.durationMs >= 0
+    ? Math.round(input.durationMs)
+    : undefined;
+
+  return {
+    id,
+    timestamp,
+    direction,
+    phase,
+    eventType,
+    label: truncate(label, MAX_AGENT_TRACE_STRING_LENGTH),
+    requestId: stringValue(input.requestId),
+    runId: stringValue(input.runId),
+    toolName: stringValue(input.toolName),
+    status: stringValue(input.status),
+    durationMs,
+    summary: input.summary ? truncate(String(input.summary), MAX_AGENT_TRACE_STRING_LENGTH) : undefined,
+    payload: sanitizeTracePayload(input.payload, 0)
+  };
+}
+
+function sanitizeTracePayload(input: unknown, depth: number): unknown {
+  if (input === undefined) {
+    return undefined;
+  }
+
+  if (input === null || typeof input === "number" || typeof input === "boolean") {
+    return input;
+  }
+
+  if (typeof input === "string") {
+    return truncate(input, MAX_AGENT_TRACE_STRING_LENGTH);
+  }
+
+  if (depth >= 8) {
+    return "[truncated]";
+  }
+
+  if (Array.isArray(input)) {
+    return input.slice(0, 100).map((item) => sanitizeTracePayload(item, depth + 1));
+  }
+
+  if (!isRecord(input)) {
+    return undefined;
+  }
+
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input).slice(0, 100)) {
+    const normalizedKey = key.toLowerCase();
+    if (
+      normalizedKey === "dataurl" ||
+      normalizedKey === "bytes" ||
+      normalizedKey.includes("apikey") ||
+      normalizedKey.includes("secret") ||
+      normalizedKey.includes("token") ||
+      normalizedKey === "authorization"
+    ) {
+      sanitized[key] = "[redacted]";
+      continue;
+    }
+
+    sanitized[key] = sanitizeTracePayload(value, depth + 1);
+  }
+
+  return sanitized;
 }
 
 function sanitizeMessage(input: unknown): AgentConversationMessage | undefined {
@@ -362,6 +493,14 @@ function truncate(value: string, maxLength: number): string {
 
 function isAgentConversationRole(value: unknown): value is AgentConversationMessageRole {
   return typeof value === "string" && (AGENT_CONVERSATION_ROLES as readonly string[]).includes(value);
+}
+
+function isTraceDirection(value: unknown): value is AgentTraceDirection {
+  return typeof value === "string" && (AGENT_TRACE_DIRECTIONS as readonly string[]).includes(value);
+}
+
+function isTracePhase(value: unknown): value is AgentTracePhase {
+  return typeof value === "string" && (AGENT_TRACE_PHASES as readonly string[]).includes(value);
 }
 
 function stringValue(value: unknown): string | undefined {

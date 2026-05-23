@@ -7,6 +7,7 @@ ensureRuntimeStorage();
 
 const sqlite = new Database(runtimePaths.databaseFile);
 configureSqlite(sqlite);
+verifySqliteIntegrity(sqlite);
 
 function configureSqlite(database: Database.Database): void {
   database.pragma(`locking_mode = ${sqliteConfig.lockingMode}`);
@@ -35,6 +36,17 @@ function isSharedMemoryOpenError(error: unknown): boolean {
     "code" in error &&
     typeof error.code === "string" &&
     error.code === "SQLITE_IOERR_SHMOPEN"
+  );
+}
+
+function verifySqliteIntegrity(database: Database.Database): void {
+  const rows = database.pragma("quick_check") as Array<{ quick_check?: string }>;
+  if (rows.length === 1 && rows[0]?.quick_check === "ok") {
+    return;
+  }
+
+  throw new Error(
+    "SQLite integrity check failed. Stop the app and restore the database from a backup before continuing."
   );
 }
 

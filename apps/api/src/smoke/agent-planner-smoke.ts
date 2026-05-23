@@ -77,6 +77,8 @@ async function main(): Promise<void> {
   await smokeSelectedQuestionOutputFallbackPlan();
   await smokePerImageSelectedReferencePlan();
   await smokeBatchSelectedReferenceFallbackUsesAllReferences();
+  await smokeSelectedVariantFallbackPreservesExplicitCount();
+  await smokePlannerReflectsOnDroppedExplicitCount();
   await smokeSingleCombinedSelectedReferenceLimitQuestion();
   await smokeRecentOutputEditWithoutReferencesStillAsks();
   await smokeCombinedSelectedReferencePlan();
@@ -899,6 +901,78 @@ async function smokeBatchSelectedReferenceFallbackUsesAllReferences(): Promise<v
   expect(result.plan.jobs.every((job) => job.count === 1), "batch fallback keeps each edit job count at one");
   expect(result.plan.jobs.every((job) => job.references.length === 1), "batch fallback keeps one selected reference per job");
   expect(result.plan.jobs[9]?.references[0]?.assetId === "asset-ref-10", "batch fallback includes the tenth selected image");
+}
+
+async function smokeSelectedVariantFallbackPreservesExplicitCount(): Promise<void> {
+  const references = selectedReferencesMany(3);
+  const result = await createGenerationPlan({
+    userText:
+      "\u53c2\u8003\u5982\u4e0b\u63d0\u793a\u8bcd\uff0c\u751f\u62105\u5f20\u4e0d\u540c\u7684\u63d0\u793a\u8bcd\u7684\u56fe\u7247\uff1a collage-style design with layered typography.",
+    defaults,
+    selectedReferences: references,
+    llmConfig: llmConfigFixture(),
+    now,
+    runner: staticPlannerRunner({
+      kind: "agent_user_question",
+      code: "agent_requires_user_input",
+      message: "Should I edit selected originals or create new images?",
+      createdBy: "agent"
+    })
+  });
+
+  expectPlannerOk(result, "selected variant fallback preserves explicit output count");
+  expect(result.plan.jobs.length === 5, "selected variant fallback creates five variant jobs");
+  expect(result.plan.jobs.every((job) => job.count === 1), "selected variant fallback keeps one output per variant job");
+  expect(
+    result.plan.jobs.every((job) => job.references.length === references.length),
+    "selected variant fallback reuses the selected reference set for every variant"
+  );
+  expect(
+    result.plan.jobs.every((job) => job.references.every((reference) => reference.kind === "selected_canvas_image")),
+    "selected variant fallback uses selected_canvas_image references"
+  );
+}
+
+async function smokePlannerReflectsOnDroppedExplicitCount(): Promise<void> {
+  const runner = sequencedPlannerRunner([
+    planFixture({
+      jobs: [
+        jobFixture({
+          id: "collapsed_single",
+          prompt: "Create one fashion poster.",
+          count: 1
+        })
+      ]
+    }),
+    planFixture({
+      jobs: [
+        jobFixture({
+          id: "five_variants",
+          prompt: "Create five distinct fashion poster variants.",
+          count: 5
+        })
+      ]
+    })
+  ]);
+  const result = await createGenerationPlan({
+    userText: "Generate 5 different fashion poster images.",
+    defaults,
+    selectedReferences: [],
+    llmConfig: llmConfigFixture(),
+    now,
+    runner
+  });
+
+  expectPlannerOk(result, "planner reflects when explicit count is dropped");
+  expect(runner.calls.length === 2, "dropped explicit count triggers one reflection");
+  expect(result.plan.jobs[0]?.id === "five_variants", "reflection uses the corrected explicit-count plan");
+  expect(result.plan.jobs[0]?.count === 5, "reflection preserves five requested outputs");
+  const retryMessage = runner.calls[1]?.messages[1];
+  expect(isRecord(retryMessage), "explicit-count reflection includes a retry prompt");
+  expect(
+    typeof retryMessage.content === "string" && retryMessage.content.includes("explicitly requested at least 5"),
+    "explicit-count reflection prompt names the dropped count"
+  );
 }
 
 async function smokeSingleCombinedSelectedReferenceLimitQuestion(): Promise<void> {

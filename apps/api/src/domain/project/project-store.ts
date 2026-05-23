@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type {
   GeneratedAsset,
@@ -12,11 +16,17 @@ import type {
   ProjectState
 } from "../contracts.js";
 import { db } from "../../infrastructure/database.js";
+import { runtimePaths } from "../../infrastructure/runtime.js";
 import { assets, generationOutputs, generationRecords, generationReferenceAssets, projects } from "../../infrastructure/schema.js";
 
 export const DEFAULT_PROJECT_ID = "default";
 const DEFAULT_PROJECT_NAME = "Default Project";
+const PROJECT_SNAPSHOT_BACKUP_LIMIT = 50;
+const LARGE_PROJECT_SNAPSHOT_BYTES = 1024 * 1024;
+const EMPTY_PROJECT_OVERWRITE_BYTES = 16 * 1024;
+const EMPTY_PROJECT_STORE_RECORDS = 2;
 const fallbackWarnings = new Set<string>();
+const backedUpSnapshotHashes = new Set<string>();
 
 interface ProjectSnapshotInput {
   name?: string;
@@ -30,18 +40,46 @@ export interface GalleryExportAsset {
   mimeType: string;
 }
 
+export class ProjectStoreUnavailableError extends Error {
+  readonly code = "project_unavailable";
+  readonly cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.name = "ProjectStoreUnavailableError";
+    this.cause = cause;
+  }
+}
+
+export class ProjectSnapshotOverwriteRejectedError extends Error {
+  readonly code = "project_snapshot_overwrite_rejected";
+}
+
+interface SnapshotStats {
+  bytes: number;
+  storeRecords: number;
+  shapeRecords: number;
+  assetRecords: number;
+  meaningful: boolean;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
 
 function parseSnapshot(snapshotJson: string): unknown | null {
-  return JSON.parse(snapshotJson) as unknown;
+  try {
+    return JSON.parse(snapshotJson) as unknown;
+  } catch (error) {
+    throw new ProjectStoreUnavailableError("Saved project snapshot could not be parsed.", error);
+  }
 }
 
 export function ensureDefaultProject(): void {
   const existing = getDefaultProjectRow();
 
   if (existing) {
+    tryWriteProjectSnapshotBackup(existing.snapshotJson, existing.updatedAt);
     return;
   }
   if (defaultProjectRowExists()) {
@@ -65,6 +103,13 @@ export function saveProjectSnapshot(input: ProjectSnapshotInput): ProjectState {
 
   const updatedAt = nowIso();
   const current = getDefaultProjectRow();
+  if (current && shouldRejectDestructiveSnapshotSave(current.snapshotJson, input.snapshotJson)) {
+    throw new ProjectSnapshotOverwriteRejectedError(
+      "Refusing to overwrite a non-empty saved canvas with an empty snapshot."
+    );
+  }
+
+  tryWriteProjectSnapshotBackup(input.snapshotJson, updatedAt);
 
   db.update(projects)
     .set({
@@ -169,11 +214,7 @@ function getDefaultProjectRow(): (typeof projects.$inferSelect) | undefined {
   try {
     return db.select().from(projects).where(eq(projects.id, DEFAULT_PROJECT_ID)).get();
   } catch (error) {
-    warnOnce(
-      "project-read-fallback",
-      `Project row could not be read; returning a blank canvas fallback. ${formatErrorSummary(error)}`
-    );
-    return undefined;
+    throw new ProjectStoreUnavailableError("Saved project row could not be read.", error);
   }
 }
 
@@ -181,8 +222,8 @@ function defaultProjectRowExists(): boolean {
   try {
     const row = db.select({ id: projects.id }).from(projects).where(eq(projects.id, DEFAULT_PROJECT_ID)).get();
     return Boolean(row);
-  } catch {
-    return true;
+  } catch (error) {
+    throw new ProjectStoreUnavailableError("Saved project row existence could not be checked.", error);
   }
 }
 
@@ -215,6 +256,118 @@ function formatErrorSummary(error: unknown): string {
   }
 
   return String(error);
+}
+
+function shouldRejectDestructiveSnapshotSave(currentSnapshotJson: string, nextSnapshotJson: string): boolean {
+  const current = snapshotStats(currentSnapshotJson);
+  const next = snapshotStats(nextSnapshotJson);
+
+  return (
+    current.meaningful &&
+    current.bytes >= LARGE_PROJECT_SNAPSHOT_BYTES &&
+    next.bytes <= EMPTY_PROJECT_OVERWRITE_BYTES &&
+    next.storeRecords <= EMPTY_PROJECT_STORE_RECORDS &&
+    next.shapeRecords === 0 &&
+    next.assetRecords === 0
+  );
+}
+
+function snapshotStats(snapshotJson: string): SnapshotStats {
+  const bytes = Buffer.byteLength(snapshotJson, "utf8");
+  const snapshot = parseSnapshot(snapshotJson);
+  const store = snapshotStore(snapshot);
+  const keys = store ? Object.keys(store) : [];
+  const shapeRecords = keys.filter((key) => key.startsWith("shape:")).length;
+  const assetRecords = keys.filter((key) => key.startsWith("asset:")).length;
+
+  return {
+    bytes,
+    storeRecords: keys.length,
+    shapeRecords,
+    assetRecords,
+    meaningful: bytes >= LARGE_PROJECT_SNAPSHOT_BYTES || shapeRecords > 0 || assetRecords > 0
+  };
+}
+
+function snapshotStore(snapshot: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(snapshot)) {
+    return undefined;
+  }
+
+  const document = snapshot.document;
+  if (isRecord(document) && isRecord(document.store)) {
+    return document.store;
+  }
+
+  return isRecord(snapshot.store) ? snapshot.store : undefined;
+}
+
+function tryWriteProjectSnapshotBackup(snapshotJson: string, updatedAt: string): void {
+  try {
+    writeProjectSnapshotBackup(snapshotJson, updatedAt);
+  } catch (error) {
+    warnOnce("project-snapshot-backup-failed", `Project snapshot backup failed. ${formatErrorSummary(error)}`);
+  }
+}
+
+function writeProjectSnapshotBackup(snapshotJson: string, updatedAt: string): void {
+  const stats = snapshotStats(snapshotJson);
+  if (!stats.meaningful) {
+    return;
+  }
+
+  const hash = createHash("sha256").update(snapshotJson).digest("hex");
+  if (backedUpSnapshotHashes.has(hash) || backupExists(hash)) {
+    backedUpSnapshotHashes.add(hash);
+    return;
+  }
+
+  const timestamp = safeTimestamp(updatedAt);
+  const hashPrefix = hash.slice(0, 16);
+  const fileName = `${timestamp}-${hashPrefix}.json.gz`;
+  const tempFileName = `.${fileName}.${process.pid}.tmp`;
+  const finalPath = join(runtimePaths.projectSnapshotBackupsDir, fileName);
+  const tempPath = join(runtimePaths.projectSnapshotBackupsDir, tempFileName);
+
+  writeFileSync(tempPath, gzipSync(snapshotJson));
+  renameSync(tempPath, finalPath);
+  backedUpSnapshotHashes.add(hash);
+  pruneProjectSnapshotBackups();
+}
+
+function backupExists(hash: string): boolean {
+  const hashPrefix = hash.slice(0, 16);
+  return readdirSync(runtimePaths.projectSnapshotBackupsDir).some((fileName) =>
+    fileName.endsWith(`${hashPrefix}.json.gz`)
+  );
+}
+
+function pruneProjectSnapshotBackups(): void {
+  const backups = readdirSync(runtimePaths.projectSnapshotBackupsDir)
+    .filter((fileName) => fileName.endsWith(".json.gz"))
+    .map((fileName) => {
+      const filePath = join(runtimePaths.projectSnapshotBackupsDir, fileName);
+      return {
+        filePath,
+        mtimeMs: statSync(filePath).mtimeMs
+      };
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  for (const backup of backups.slice(PROJECT_SNAPSHOT_BACKUP_LIMIT)) {
+    rmSync(backup.filePath, { force: true });
+  }
+}
+
+function safeTimestamp(value: string): string {
+  const date = new Date(value);
+  const iso = Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+
+  return iso.replace(/[:.]/gu, "-");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function readGenerationHistory(): ApiGenerationRecord[] {

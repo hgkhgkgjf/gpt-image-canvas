@@ -121,7 +121,7 @@ Stores local Agent conversation history and resumable context snapshots.
 | --- | --- | --- |
 | `id` | text | Primary key. |
 | `title` | text | Required conversation title shown in history. |
-| `messages_json` | text | Required serialized Agent transcript. |
+| `messages_json` | text | Required serialized Agent transcript and optional benchmark trace payload. |
 | `context_json` | text | Required serialized resumable Agent context. |
 | `created_at` | text | Required ISO timestamp. |
 | `updated_at` | text | Required ISO timestamp; indexed for latest-first history. |

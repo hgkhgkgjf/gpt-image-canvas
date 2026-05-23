@@ -121,6 +121,25 @@ export interface AgentConversationMessage {
   previews?: AgentConversationAssetPreview[];
 }
 
+export type AgentTraceDirection = "client" | "server" | "local";
+export type AgentTracePhase = "connection" | "planning" | "execution" | "tool_call" | "stream" | "error" | "system";
+
+export interface AgentTraceEntry {
+  id: string;
+  timestamp: string;
+  direction: AgentTraceDirection;
+  phase: AgentTracePhase;
+  eventType: string;
+  label: string;
+  requestId?: string;
+  runId?: string;
+  toolName?: string;
+  status?: string;
+  durationMs?: number;
+  summary?: string;
+  payload?: unknown;
+}
+
 export interface AgentConversationOutputReference {
   index: number;
   assetId: string;
@@ -153,6 +172,7 @@ export interface AgentConversation {
   id: string;
   title: string;
   messages: AgentConversationMessage[];
+  trace?: AgentTraceEntry[];
   createdAt: string;
   updatedAt: string;
 }
@@ -164,6 +184,7 @@ export interface AgentConversationListResponse {
 export interface SaveAgentConversationRequest {
   title?: string;
   messages: AgentConversationMessage[];
+  trace?: AgentTraceEntry[];
 }
 
 export interface SaveAgentConversationResponse {
@@ -234,6 +255,7 @@ export type AgentServerEventType =
   | "context_resolved"
   | "assistant_delta"
   | "assistant_thinking_delta"
+  | "tool_call"
   | "plan_created"
   | "plan_updated"
   | "job_started"
@@ -293,6 +315,19 @@ export interface AgentAssistantDeltaEvent extends AgentBaseServerEvent {
 export interface AgentAssistantThinkingDeltaEvent extends AgentBaseServerEvent {
   type: "assistant_thinking_delta";
   delta: string;
+}
+
+export interface AgentToolCallEvent extends AgentBaseServerEvent {
+  type: "tool_call";
+  phase: "started" | "completed" | "failed";
+  toolName: "create_generation_plan" | "generate_canvas_image_job";
+  toolCallId: string;
+  planId?: string;
+  jobId?: string;
+  durationMs?: number;
+  input?: unknown;
+  output?: unknown;
+  error?: string;
 }
 
 export interface AgentPlanCreatedEvent extends AgentBaseServerEvent {
@@ -362,6 +397,7 @@ export type AgentServerEvent =
   | AgentErrorEvent
   | AgentAssistantDeltaEvent
   | AgentAssistantThinkingDeltaEvent
+  | AgentToolCallEvent
   | AgentPlanCreatedEvent
   | AgentPlanUpdatedEvent
   | AgentJobStartedEvent

@@ -78,11 +78,19 @@ function parseSaveAgentConversationPayload(input: unknown):
     };
   }
 
+  if (input.trace !== undefined && !Array.isArray(input.trace)) {
+    return {
+      ok: false,
+      error: errorResponse("invalid_agent_conversation", "Agent conversation trace must be an array.")
+    };
+  }
+
   return {
     ok: true,
     value: {
       title: input.title,
-      messages: input.messages as AgentConversationMessage[]
+      messages: input.messages as AgentConversationMessage[],
+      trace: input.trace as SaveAgentConversationRequest["trace"]
     }
   };
 }

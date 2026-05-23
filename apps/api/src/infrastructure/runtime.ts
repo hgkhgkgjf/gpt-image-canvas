@@ -65,6 +65,7 @@ export const runtimePaths = {
   assetsDir: resolve(dataDir, "assets"),
   assetPreviewsDir: resolve(dataDir, "asset-previews"),
   databaseFile: resolve(dataDir, "gpt-image-canvas.sqlite"),
+  projectSnapshotBackupsDir: resolve(dataDir, "project-snapshot-backups"),
   promptPoolDir: resolveFromRepo(optionalEnvPath(process.env.PROMPT_POOL_DIR) ?? defaultPromptPoolDir()),
   webDistDir: resolve(repoRoot, "apps/web/dist")
 };
@@ -83,4 +84,5 @@ export function ensureRuntimeStorage(): void {
   mkdirSync(runtimePaths.dataDir, { recursive: true });
   mkdirSync(runtimePaths.assetsDir, { recursive: true });
   mkdirSync(runtimePaths.assetPreviewsDir, { recursive: true });
+  mkdirSync(runtimePaths.projectSnapshotBackupsDir, { recursive: true });
 }

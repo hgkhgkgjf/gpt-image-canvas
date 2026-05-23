@@ -1,10 +1,32 @@
 import type { Hono } from "hono";
-import { getProjectState, saveProjectSnapshot } from "../../domain/project/project-store.js";
+import {
+  getProjectState,
+  ProjectSnapshotOverwriteRejectedError,
+  ProjectStoreUnavailableError,
+  saveProjectSnapshot
+} from "../../domain/project/project-store.js";
+import { errorResponse } from "../http/errors.js";
 import { readJson } from "../http/json.js";
 import { logProjectSaveRejected, parseProjectPayload } from "../http/validation.js";
 
 export function registerProjectRoutes(app: Hono): void {
-  app.get("/api/project", (c) => c.json(getProjectState()));
+  app.get("/api/project", (c) => {
+    try {
+      return c.json(getProjectState());
+    } catch (error) {
+      if (error instanceof ProjectStoreUnavailableError) {
+        return c.json(
+          errorResponse(
+            error.code,
+            "Saved project data could not be read safely. Stop editing and restore from a backup before continuing."
+          ),
+          503
+        );
+      }
+
+      throw error;
+    }
+  });
 
   app.put("/api/project", async (c) => {
     const payload = await readJson(c.req.raw);
@@ -19,6 +41,30 @@ export function registerProjectRoutes(app: Hono): void {
       return c.json(parsed.error, 400);
     }
 
-    return c.json(saveProjectSnapshot(parsed.value));
+    try {
+      return c.json(saveProjectSnapshot(parsed.value));
+    } catch (error) {
+      if (error instanceof ProjectSnapshotOverwriteRejectedError) {
+        return c.json(
+          errorResponse(
+            error.code,
+            "Refusing to overwrite a non-empty saved canvas with an empty snapshot. Reload the project before saving."
+          ),
+          409
+        );
+      }
+
+      if (error instanceof ProjectStoreUnavailableError) {
+        return c.json(
+          errorResponse(
+            error.code,
+            "Saved project data could not be read safely. Stop editing and restore from a backup before continuing."
+          ),
+          503
+        );
+      }
+
+      throw error;
+    }
   });
 }

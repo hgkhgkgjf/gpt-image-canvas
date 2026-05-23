@@ -78,6 +78,41 @@ button {
   touch-action: manipulation;
 }
 
+.app-root :where(
+  .top-navigation,
+  .ai-panel,
+  .home-page,
+  .gallery-page,
+  .pool-page,
+  .provider-config-dialog,
+  .prompt-favorites-panel,
+  .agent-history-dialog,
+  .codex-login-dialog,
+  .gallery-modal,
+  .pool-modal
+) :where(h1, h2, h3, h4, h5, h6, p, span, li, dt, dd, strong, small, time, figcaption, code, pre, label) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.agent-plan-node,
+.agent-plan-node :where(h2, p, span, strong, small, figcaption) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.agent-plan-node :where(
+  button,
+  button *,
+  .agent-plan-node__thumbnail,
+  .agent-plan-node__thumbnail *,
+  .agent-plan-node__detail-output-thumb,
+  .agent-plan-node__detail-output-thumb *
+) {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 .app-root h1,
 .app-root h2,
 .app-root h3,
